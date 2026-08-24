@@ -1027,7 +1027,10 @@ class App:
                                   tags="cross")
         g["dbgd"] = cv.create_rectangle(0, 0, 0, 0, state="hidden",
                                         fill="#333c46", outline="", tags="cross")
+        cv.tag_lower(g["dbgd"], g["did"])
+        cv.tag_raise(g["pid"])
         cv.tag_raise("cross")
+        g["_shown"] = False
 
     # ---------- 主图 ----------
 
@@ -1268,17 +1271,18 @@ class App:
               "ind": self.cv_ind}[key]
         y = max(min(event.y, sg["T"] + sg["ph"]), sg["T"])
         cv.coords(sg["hid"], sg["L"], y, sg["w"] - sg["R"], y)
-        cv.itemconfigure(sg["hid"], state="normal")
+        if not sg["_shown"]:
+            for it in ("hid", "pid", "pbg", "did", "dbgd"):
+                cv.itemconfigure(sg[it], state="normal")
+            sg["_shown"] = True
         price = sg["hi_v"] - (y - sg["T"]) / sg["ph"] * (
             sg["hi_v"] - sg["lo_v"])
         fmt = sg.get("fmt")
         txt = fmt(price) if fmt else f"{price:.2f}"
         px = sg["w"] - sg["R"] + 30
         cv.coords(sg["pid"], px, y)
-        cv.itemconfigure(sg["pid"], text=txt, state="normal")
+        cv.itemconfigure(sg["pid"], text=txt)
         cv.coords(sg["pbg"], px - 27, y - 9, px + 29, y + 9)
-        cv.itemconfigure(sg["pbg"], state="normal")
-        cv.tag_raise(sg["pid"])
 
         # 3) 吸附数据：仅跨越K线时更新日期标签与 OHLC 读数
         idx = int((event.x - sg["L"]) / sg["bw"])
@@ -1298,13 +1302,11 @@ class App:
             c2 = {"main": self.cv_main, "vol": self.cv_vol,
                   "ind": self.cv_ind}[k]
             c2.coords(s2["did"], cx, s2["h"] - s2["B"] // 2 + 2)
-            c2.itemconfigure(s2["did"], text=dl, state="normal")
+            c2.itemconfigure(s2["did"], text=dl)
             w_bg = len(dl) * 7 + 10
             c2.coords(s2["dbgd"], cx - w_bg / 2,
                       s2["h"] - s2["B"] // 2 - 5,
                       cx + w_bg / 2, s2["h"] - s2["B"] // 2 + 11)
-            c2.itemconfigure(s2["dbgd"], state="normal")
-            c2.tag_lower(s2["dbgd"], s2["did"])
 
         bars = self.view["bars"]
         if idx >= len(bars):
@@ -1346,6 +1348,10 @@ class App:
     def _on_leave(self, _event, _key=None):
         self.hover_var.set("")
         self._mtn = None
+        for k2 in ("main", "vol", "ind"):
+            sg2 = self.scales.get(k2)
+            if sg2:
+                sg2["_shown"] = False
         for k in ("main", "vol", "ind"):
             sg = self.scales.get(k)
             if not sg:
