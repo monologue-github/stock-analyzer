@@ -1268,14 +1268,17 @@ class App:
               "ind": self.cv_ind}[key]
         y = max(min(event.y, sg["T"] + sg["ph"]), sg["T"])
         cv.coords(sg["hid"], sg["L"], y, sg["w"] - sg["R"], y)
+        cv.itemconfigure(sg["hid"], state="normal")
         price = sg["hi_v"] - (y - sg["T"]) / sg["ph"] * (
             sg["hi_v"] - sg["lo_v"])
         fmt = sg.get("fmt")
         txt = fmt(price) if fmt else f"{price:.2f}"
         px = sg["w"] - sg["R"] + 30
         cv.coords(sg["pid"], px, y)
-        cv.itemconfigure(sg["pid"], text=txt)
+        cv.itemconfigure(sg["pid"], text=txt, state="normal")
         cv.coords(sg["pbg"], px - 27, y - 9, px + 29, y + 9)
+        cv.itemconfigure(sg["pbg"], state="normal")
+        cv.tag_raise(sg["pid"])
 
         # 3) 吸附数据：仅跨越K线时更新日期标签与 OHLC 读数
         idx = int((event.x - sg["L"]) / sg["bw"])
