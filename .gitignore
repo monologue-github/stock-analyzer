@@ -1,0 +1,5 @@
+# 本地配置（含 API Key，勿提交）
+stock_gui.ini
+
+__pycache__/
+*.pyc
