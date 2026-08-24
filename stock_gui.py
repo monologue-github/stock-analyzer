@@ -106,9 +106,9 @@ def normalize_code(code):
     d = "".join(ch for ch in code if ch.isdigit())
     if len(d) != 6:
         raise ValueError(f"代码格式不对: {code}")
-    if d[0] in "69":
+    if d[0] in "69" or d[:2] in ("51", "56", "58"):      # 沪股/沪ETF
         return "sh" + d
-    if d[0] in "03":
+    if d[0] in "03" or d[:2] in ("15", "16", "18"):      # 深股/深ETF/LOF
         return "sz" + d
     if d[0] in "48":
         return "bj" + d
