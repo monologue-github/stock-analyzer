@@ -17,8 +17,8 @@ import math
 import os
 import threading
 import time
-import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
@@ -142,25 +142,34 @@ def fmt_vol_cn(v):
     return f"{v:.0f}"
 
 
+_SECTOR_CACHE = {}          # code -> (timestamp, 结果三元组)
+_SECTOR_CACHE_TTL = 1800    # 30 分钟
+
+
 def fetch_sector_context(full):
     """个股所属行业板块指数上下文。
 
     返回 (板块名, {date: 当日涨跌%}, 板块今日涨跌%)；失败返回 (None, {}, None)。
+    带 30 分钟缓存：板块日内变化不大，命中缓存零耗时。
     """
+    now = time.time()
+    hit = _SECTOR_CACHE.get(full)
+    if hit and now - hit[0] < _SECTOR_CACHE_TTL:
+        return hit[1]
     UT = "fa5fd1943c7b386f172d6893dbfba10b"
     hdr = {"User-Agent": "Mozilla/5.0",
            "Referer": "https://quote.eastmoney.com/"}
 
-    def get(u, timeout=10):
+    def get(u, timeout=6):
         last = None
-        for a in range(3):
+        for a in range(2):
             try:
                 req = urllib.request.Request(u, headers=hdr)
                 with urllib.request.urlopen(req, timeout=timeout) as r:
                     return r.read().decode("utf-8")
             except Exception as e:
                 last = e
-                time.sleep(0.8 * (a + 1))
+                time.sleep(0.4 * (a + 1))
         raise last
 
     try:
@@ -308,38 +317,57 @@ W_WINDOW, TOPK = 10, 10
 def analyze(full):
     """全量分析，切片交给GUI。"""
     W = W_WINDOW
-    q = fetch_quote(full)
-    rows = fetch_daily(full)
+    # ---- 并发拉取全部数据源（个股行情/K线、上证行情/K线、板块）----
+    now_ts = time.time()
+    sec_cached = _SECTOR_CACHE.get(full)
+    sec_hit = bool(sec_cached and now_ts - sec_cached[0] < _SECTOR_CACHE_TTL)
+    with ThreadPoolExecutor(max_workers=5 if not sec_hit else 4) as ex:
+        f_q = ex.submit(fetch_quote, full)
+        f_rows = ex.submit(fetch_daily, full)
+        f_iq = ex.submit(fetch_quote, "sh000001")
+        f_ir = ex.submit(fetch_daily, "sh000001")
+        f_sec = None if sec_hit else ex.submit(fetch_sector_context, full)
+        q = f_q.result()
+        rows = f_rows.result()
 
-    # 识别今日盘中bar
-    today_str = time.strftime("%Y-%m-%d")
-    live = None
-    if rows[-1]["date"] == today_str:
-        live = rows.pop()          # 形态匹配剔除今日盘中
-        live["close"] = q["price"]
-        live["high"] = max(live["high"], q["price"])
-        live["low"] = min(live["low"], q["price"]) if q["low"] > 0 else live["low"]
+        # 识别今日盘中bar
+        today_str = time.strftime("%Y-%m-%d")
+        live = None
+        if rows[-1]["date"] == today_str:
+            live = rows.pop()          # 形态匹配剔除今日盘中
+            live["close"] = q["price"]
+            live["high"] = max(live["high"], q["price"])
+            live["low"] = min(live["low"], q["price"]) if q["low"] > 0 else live["low"]
+
+        try:
+            iq = f_iq.result()
+            idx_chg_today = ((iq["price"] / iq["prev_close"]) * 100 - 100
+                             if iq["prev_close"] else 0.0)
+        except Exception:
+            idx_chg_today = None
+        try:
+            idx_rows = f_ir.result()
+            idx_chg_by_date = {
+                b["date"]: (b["close"] / a["close"]) * 100 - 100
+                for a, b in zip(idx_rows, idx_rows[1:])
+            }
+        except Exception:
+            idx_chg_by_date = {}
+        try:
+            if sec_hit:
+                sec_name, sec_chg_by_date, sec_chg_today = sec_cached[1]
+            else:
+                sec_name, sec_chg_by_date, sec_chg_today = f_sec.result(
+                    timeout=8)
+                if sec_name:
+                    _SECTOR_CACHE[full] = (
+                        time.time(),
+                        (sec_name, sec_chg_by_date, sec_chg_today))
+        except Exception:
+            sec_name, sec_chg_by_date, sec_chg_today = None, {}, None
 
     closes_m = [r["close"] for r in rows]
     rets = logret(closes_m)
-
-    # ---- 大盘与量能上下文（纳入样本匹配）----
-    try:
-        iq = fetch_quote("sh000001")
-        idx_chg_today = ((iq["price"] / iq["prev_close"]) * 100 - 100
-                         if iq["prev_close"] else 0.0)
-    except Exception:
-        idx_chg_today = None
-    try:
-        idx_rows = fetch_daily("sh000001")
-        idx_chg_by_date = {
-            b["date"]: (b["close"] / a["close"]) * 100 - 100
-            for a, b in zip(idx_rows, idx_rows[1:])
-        }
-    except Exception:
-        idx_chg_by_date = {}
-
-    sec_name, sec_chg_by_date, sec_chg_today = fetch_sector_context(full)
 
     vols_m = [r.get("vol") or 0.0 for r in rows]
     vr_now = vol_ratio_at(vols_m, len(vols_m) - 1)
@@ -927,7 +955,10 @@ class App:
         n = max(20, min(250, n))
         self.show_n.set(n)
         self.info_var.set(f"K线根数: {n}")
-        self._rerender()
+        # 防抖：连续滚动只触发一次重绘
+        if getattr(self, "_wheel_job", None):
+            self.root.after_cancel(self._wheel_job)
+        self._wheel_job = self.root.after(60, self._rerender)
 
     def _on_resize(self, _event):
         if getattr(self, "_resize_job", None):
@@ -1220,6 +1251,11 @@ class App:
         g = self.scales[key]
         idx = int((event.x - g["L"]) / g["bw"])
         idx = max(0, min(g["n"] - 1, idx))
+        # 节流：同一根K线且纵向移动 <4px 时跳过重绘
+        cur_sig = (key, idx, round(event.y / 4))
+        if getattr(self, "_mtn", None) == cur_sig:
+            return
+        self._mtn = cur_sig
         cx = g["L"] + g["bw"] * (idx + 0.5)
         date = g["dates"][idx]
 
@@ -1240,11 +1276,10 @@ class App:
                 px = sg["w"] - sg["R"] + 30
                 cv.coords(sg["pid"], px, y)
                 cv.itemconfigure(sg["pid"], text=txt, state="normal")
-                bb = cv.bbox(sg["pid"])
-                if bb:
-                    cv.coords(sg["pbg"], bb[0] - 3, bb[1], bb[2] + 3, bb[3])
-                    cv.itemconfigure(sg["pbg"], state="normal")
-                    cv.tag_raise(sg["pid"])   # 文字必须在色块之上
+                # 固定尺寸色块，免去每帧 bbox 测量
+                cv.coords(sg["pbg"], px - 26, y - 9, px + 28, y + 9)
+                cv.itemconfigure(sg["pbg"], state="normal")
+                cv.tag_raise(sg["pid"])   # 文字必须在色块之上
             dl = date if len(date) <= 8 else date[:10]
             cv.coords(sg["did"], cx, sg["h"] - sg["B"] // 2 + 2)
             cv.itemconfigure(sg["did"], text=dl, state="normal")
