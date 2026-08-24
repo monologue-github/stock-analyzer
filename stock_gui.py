@@ -1062,17 +1062,23 @@ class App:
             if self.ma_on[nn].get():
                 self._line(cv, xs, v["ma"][nn], ymap, MA_COLORS[nn])
 
+        yo = yc = None
         for i, b in enumerate(bars):
             x = xs(i)
             isp = b["date"] == "T+1预测"
             up = b["close"] >= b["open"]
             color = PRED_C if isp else (UP if up else DOWN)
             dash = (3, 2) if isp else ()
-            bw2 = max(g["bw"] * 0.62, 2)
-            # 单元素K线：粗竖线同时充当影线+实体（大幅减少画布对象数）
+            yo, yc = ymap(b["open"]), ymap(b["close"])
             cv.create_line(x, ymap(b["high"]), x, ymap(b["low"]),
-                           fill=color, width=max(int(bw2), 1),
-                           capstyle="butt", dash=dash)
+                           fill=color, dash=dash)
+            bw2 = max(g["bw"] * 0.62, 2)
+            ty, by2 = min(yo, yc), max(yo, yc)
+            if by2 - ty < 1:
+                by2 = ty + 1
+            cv.create_rectangle(x - bw2 / 2, ty, x + bw2 / 2, by2,
+                                fill="" if isp else color,
+                                outline=color, dash=dash)
 
         for i, day, typ, txt in v["signals"]:
             if i >= len(bars) - 1:
@@ -1269,6 +1275,7 @@ class App:
         xv = max(min(event.x, sg["w"] - sg["R"]), sg["L"])
         y = max(min(event.y, sg["T"] + sg["ph"]), sg["T"])
         cv.coords(sg["vid"], xv, sg["T"] + 2, xv, sg["h"] - sg["B"])
+        cv.coords(sg["hid"], sg["L"], y, sg["w"] - sg["R"], y)
         price = sg["hi_v"] - (y - sg["T"]) / sg["ph"] * (
             sg["hi_v"] - sg["lo_v"])
         fmt = sg.get("fmt")
