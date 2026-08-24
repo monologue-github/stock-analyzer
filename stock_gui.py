@@ -1251,88 +1251,112 @@ class App:
         g = self.scales[key]
         idx = int((event.x - g["L"]) / g["bw"])
         idx = max(0, min(g["n"] - 1, idx))
-        # 节流：同一根K线且纵向移动 <4px 时跳过重绘
-        cur_sig = (key, idx, round(event.y / 4))
-        if getattr(self, "_mtn", None) == cur_sig:
-            return
-        self._mtn = cur_sig
-        cx = g["L"] + g["bw"] * (idx + 0.5)
-        date = g["dates"][idx]
+        y = max(min(event.y, g["T"] + g["ph"]), g["T"])
 
-        for k, cv in (("main", self.cv_main), ("vol", self.cv_vol),
-                      ("ind", self.cv_ind)):
+        # 轻操作：三条竖线跟随（每次都做，开销极小）
+        cx = g["L"] + g["bw"] * (idx + 0.5)
+        for k in ("main", "vol", "ind"):
             sg = self.scales.get(k)
             if not sg:
                 continue
-            cv.coords(sg["vid"], cx, sg["T"], cx, sg["h"] - sg["B"])
-            cv.itemconfigure(sg["vid"], state="normal")
+            cv2 = {"main": self.cv_main, "vol": self.cv_vol,
+                   "ind": self.cv_ind}[k]
+            cv2.coords(sg["vid"], cx, sg["T"], cx, sg["h"] - sg["B"])
+            cv2.itemconfigure(sg["vid"], state="normal")
+
+        # 重操作：仅当跨越K线或纵向移动超过阈值时执行
+        sig = (key, idx, event.y // 3)
+        if getattr(self, "_mtn", None) == (key, idx) + (event.y // 3,) \
+                and getattr(self, "_mtn_key", None) == key:
+            # 仅移动悬停横线
+            sg = self.scales[key]
+            cv = {"main": self.cv_main, "vol": self.cv_vol,
+                  "ind": self.cv_ind}[key]
+            cv.coords(sg["hid"], sg["L"], y, sg["w"] - sg["R"], y)
+            return
+
+        self._mtn = (key, idx) + (event.y // 3,)
+        self._mtn_key = key
+
+        for k in ("main", "vol", "ind"):
+            sg = self.scales.get(k)
+            if not sg:
+                continue
+            cv = {"main": self.cv_main, "vol": self.cv_vol,
+                  "ind": self.cv_ind}[k]
             if k == key:
-                y = min(max(event.y, sg["T"]), sg["T"] + sg["ph"])
                 cv.coords(sg["hid"], sg["L"], y, sg["w"] - sg["R"], y)
                 cv.itemconfigure(sg["hid"], state="normal")
-                price = sg["hi_v"] - (y - sg["T"]) / sg["ph"] * (sg["hi_v"] - sg["lo_v"])
+                price = sg["hi_v"] - (y - sg["T"]) / sg["ph"] * (
+                    sg["hi_v"] - sg["lo_v"])
                 fmt = sg.get("fmt")
                 txt = fmt(price) if fmt else f"{price:.2f}"
                 px = sg["w"] - sg["R"] + 30
                 cv.coords(sg["pid"], px, y)
                 cv.itemconfigure(sg["pid"], text=txt, state="normal")
-                # 固定尺寸色块，免去每帧 bbox 测量
-                cv.coords(sg["pbg"], px - 26, y - 9, px + 28, y + 9)
+                cv.coords(sg["pbg"], px - 27, y - 9, px + 29, y + 9)
                 cv.itemconfigure(sg["pbg"], state="normal")
-                cv.tag_raise(sg["pid"])   # 文字必须在色块之上
-            dl = date if len(date) <= 8 else date[:10]
+                cv.tag_raise(sg["pid"])
+            dl = (idx < len(g["dates"]) and g["dates"][idx]) or ""
+            dl = dl if len(dl) <= 10 else dl[:10]
             cv.coords(sg["did"], cx, sg["h"] - sg["B"] // 2 + 2)
             cv.itemconfigure(sg["did"], text=dl, state="normal")
-            bb = cv.bbox(sg["did"])
-            if bb:
-                cv.coords(sg["dbgd"], bb[0] - 3, bb[1] - 1, bb[2] + 3, bb[3] + 1)
-                cv.itemconfigure(sg["dbgd"], state="normal")
-                cv.tag_lower(sg["dbgd"], sg["did"])
+            w_bg = len(dl) * 7 + 10
+            cv.coords(sg["dbgd"], cx - w_bg / 2, sg["h"] - sg["B"] // 2 - 5,
+                      cx + w_bg / 2, sg["h"] - sg["B"] // 2 + 11)
+            cv.itemconfigure(sg["dbgd"], state="normal")
+            cv.tag_lower(sg["dbgd"], sg["did"])
 
-        # OHLC 提示
+        # OHLC 读数（仅跨K线时更新）
         bars = self.view["bars"]
-        if idx < len(bars):
-            b = bars[idx]
-            v = self.view
-            ind_txt = ""
-            name = self.ind_name.get()
-            if b["date"] != "T+1预测" and idx < len(v["dif"]) \
-                    and v["dif"][idx] is not None:
-                if name == "MACD":
-                    if v["dea"][idx] is not None and v["mhist"][idx] is not None:
-                        ind_txt = (f"  DIF:{v['dif'][idx]:.3f} "
-                                   f"DEA:{v['dea'][idx]:.3f} "
-                                   f"MACD:{v['mhist'][idx]:.3f}")
-                elif name == "KDJ":
-                    ind_txt = (f"  K:{v['k'][idx]:.1f} D:{v['d'][idx]:.1f} "
-                               f"J:{v['j'][idx]:.1f}")
-                else:
-                    r6 = v["rsi6"][idx]
-                    r12 = v["rsi12"][idx]
-                    ind_txt = ("  RSI6:%.1f RSI12:%s"
-                               % (r6, f"{r12:.1f}" if r12 is not None else "-"))
-            if b["date"] == "T+1预测":
-                self.hover_var.set(
-                    f"[预测T+1] 开{b['open']:.2f} 高{b['high']:.2f} "
-                    f"低{b['low']:.2f} 收{b['close']:.2f}")
+        if idx >= len(bars):
+            return
+        b = bars[idx]
+        v = self.view
+        ind_txt = ""
+        name = self.ind_name.get()
+        if b["date"] != "T+1预测" and idx < len(v["dif"]) \
+                and v["dif"][idx] is not None:
+            if name == "MACD":
+                if v["dea"][idx] is not None and v["mhist"][idx] is not None:
+                    ind_txt = (f"  DIF:{v['dif'][idx]:.3f} "
+                               f"DEA:{v['dea'][idx]:.3f} "
+                               f"MACD:{v['mhist'][idx]:.3f}")
+            elif name == "KDJ":
+                ind_txt = (f"  K:{v['k'][idx]:.1f} D:{v['d'][idx]:.1f} "
+                           f"J:{v['j'][idx]:.1f}")
             else:
-                if idx > 0:
-                    pc = bars[idx - 1]["close"]
-                else:
-                    off = self.view["off"]
-                    pc = (self.res["disp_rows"][off - 1]["close"]
-                          if off > 0 else self.res["prev_close"])
-                chg = (b["close"] / pc - 1) * 100
-                vol_s = f"{b['vol']/10000:.0f}万手" if b.get("vol") else "-"
-                self.hover_var.set(
-                    f"{b['date']} 开{b['open']:.2f} 高{b['high']:.2f} "
-                    f"低{b['low']:.2f} 收{b['close']:.2f} ({chg:+.2f}%) "
-                    f"量{vol_s}{ind_txt}")
+                r6 = v["rsi6"][idx]
+                r12 = v["rsi12"][idx]
+                ind_txt = ("  RSI6:%.1f RSI12:%s"
+                           % (r6, f"{r12:.1f}" if r12 is not None else "-"))
+        if b["date"] == "T+1预测":
+            self.hover_var.set(
+                f"[预测T+1] 开{b['open']:.2f} 高{b['high']:.2f} "
+                f"低{b['low']:.2f} 收{b['close']:.2f}")
+            return
+        pc = bars[idx - 1]["close"] if idx > 0 else (
+            self.res["disp_rows"][self.view["off"] - 1]["close"]
+            if self.view["off"] > 0 else self.res["prev_close"])
+        chg = (b["close"] / pc - 1) * 100
+        vol_s = (fmt_vol_cn(b["vol"]) + "手") if b.get("vol") else "-"
+        self.hover_var.set(
+            f"{b['date']} 开{b['open']:.2f} 高{b['high']:.2f} "
+            f"低{b['low']:.2f} 收{b['close']:.2f} ({chg:+.2f}%) "
+            f"量{vol_s}{ind_txt}")
 
     def _on_leave(self, _event):
         self.hover_var.set("")
-        for _, cv in self.chart_keys:
-            cv.itemconfigure("cross", state="hidden")
+        self._mtn = None
+        for k in ("main", "vol", "ind"):
+            sg = self.scales.get(k)
+            if not sg:
+                continue
+            cv = {"main": self.cv_main, "vol": self.cv_vol,
+                  "ind": self.cv_ind}[k]
+            for it in ("vid", "hid", "pid", "pbg", "did", "dbgd"):
+                if it in sg:
+                    cv.itemconfigure(sg[it], state="hidden")
 
     # ---------- 文字区 ----------
 
