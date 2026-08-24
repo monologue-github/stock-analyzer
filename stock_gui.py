@@ -1014,6 +1014,7 @@ class App:
         cv.delete("cross")
         g["vid"] = cv.create_line(0, 0, 0, 0, state="hidden", fill=CROSS_C,
                                   dash=(4, 3), tags="cross")
+        g["vid_state"] = "hidden"
         g["hid"] = cv.create_line(0, 0, 0, 0, state="hidden", fill=CROSS_C,
                                   dash=(4, 3), tags="cross")
         g["pid"] = cv.create_text(g["w"] - g["R"] + 34, 0, text="", state="hidden",
@@ -1246,68 +1247,62 @@ class App:
     # ---------- 十字光标 ----------
 
     def _on_motion(self, event, key):
+        """十字光标连续跟随鼠标；数据读数吸附最近K线。"""
         if key not in self.scales or not self.view:
             return
-        g = self.scales[key]
-        idx = int((event.x - g["L"]) / g["bw"])
-        idx = max(0, min(g["n"] - 1, idx))
-        y = max(min(event.y, g["T"] + g["ph"]), g["T"])
 
-        # 轻操作：三条竖线跟随（每次都做，开销极小）
-        cx = g["L"] + g["bw"] * (idx + 0.5)
+        # 1) 竖线：三面板按原始 x 连续跟随（不吸附）
         for k in ("main", "vol", "ind"):
             sg = self.scales.get(k)
             if not sg:
                 continue
             cv2 = {"main": self.cv_main, "vol": self.cv_vol,
                    "ind": self.cv_ind}[k]
-            cv2.coords(sg["vid"], cx, sg["T"], cx, sg["h"] - sg["B"])
+            xv = max(min(event.x, sg["w"] - sg["R"]), sg["L"])
+            cv2.coords(sg["vid"], xv, sg["T"], xv, sg["h"] - sg["B"])
             cv2.itemconfigure(sg["vid"], state="normal")
 
-        # 重操作：仅当跨越K线或纵向移动超过阈值时执行
-        sig = (key, idx, event.y // 3)
-        if getattr(self, "_mtn", None) == (key, idx) + (event.y // 3,) \
-                and getattr(self, "_mtn_key", None) == key:
-            # 仅移动悬停横线
-            sg = self.scales[key]
-            cv = {"main": self.cv_main, "vol": self.cv_vol,
-                  "ind": self.cv_ind}[key]
-            cv.coords(sg["hid"], sg["L"], y, sg["w"] - sg["R"], y)
-            return
+        # 2) 悬停面板：横线 + 价格标签逐像素跟随
+        sg = self.scales[key]
+        cv = {"main": self.cv_main, "vol": self.cv_vol,
+              "ind": self.cv_ind}[key]
+        y = max(min(event.y, sg["T"] + sg["ph"]), sg["T"])
+        cv.coords(sg["hid"], sg["L"], y, sg["w"] - sg["R"], y)
+        price = sg["hi_v"] - (y - sg["T"]) / sg["ph"] * (
+            sg["hi_v"] - sg["lo_v"])
+        fmt = sg.get("fmt")
+        txt = fmt(price) if fmt else f"{price:.2f}"
+        px = sg["w"] - sg["R"] + 30
+        cv.coords(sg["pid"], px, y)
+        cv.itemconfigure(sg["pid"], text=txt)
+        cv.coords(sg["pbg"], px - 27, y - 9, px + 29, y + 9)
 
-        self._mtn = (key, idx) + (event.y // 3,)
-        self._mtn_key = key
+        # 3) 吸附数据：仅跨越K线时更新日期标签与 OHLC 读数
+        idx = int((event.x - sg["L"]) / sg["bw"])
+        idx = max(0, min(sg["n"] - 1, idx))
+        cx = sg["L"] + sg["bw"] * (idx + 0.5)
+        sig = (key, idx)
+        if getattr(self, "_mtn", None) == sig:
+            return
+        self._mtn = sig
+        date = sg["dates"][idx]
+        dl = date if len(date) <= 10 else date[:10]
 
         for k in ("main", "vol", "ind"):
-            sg = self.scales.get(k)
-            if not sg:
+            s2 = self.scales.get(k)
+            if not s2:
                 continue
-            cv = {"main": self.cv_main, "vol": self.cv_vol,
+            c2 = {"main": self.cv_main, "vol": self.cv_vol,
                   "ind": self.cv_ind}[k]
-            if k == key:
-                cv.coords(sg["hid"], sg["L"], y, sg["w"] - sg["R"], y)
-                cv.itemconfigure(sg["hid"], state="normal")
-                price = sg["hi_v"] - (y - sg["T"]) / sg["ph"] * (
-                    sg["hi_v"] - sg["lo_v"])
-                fmt = sg.get("fmt")
-                txt = fmt(price) if fmt else f"{price:.2f}"
-                px = sg["w"] - sg["R"] + 30
-                cv.coords(sg["pid"], px, y)
-                cv.itemconfigure(sg["pid"], text=txt, state="normal")
-                cv.coords(sg["pbg"], px - 27, y - 9, px + 29, y + 9)
-                cv.itemconfigure(sg["pbg"], state="normal")
-                cv.tag_raise(sg["pid"])
-            dl = (idx < len(g["dates"]) and g["dates"][idx]) or ""
-            dl = dl if len(dl) <= 10 else dl[:10]
-            cv.coords(sg["did"], cx, sg["h"] - sg["B"] // 2 + 2)
-            cv.itemconfigure(sg["did"], text=dl, state="normal")
+            c2.coords(s2["did"], cx, s2["h"] - s2["B"] // 2 + 2)
+            c2.itemconfigure(s2["did"], text=dl, state="normal")
             w_bg = len(dl) * 7 + 10
-            cv.coords(sg["dbgd"], cx - w_bg / 2, sg["h"] - sg["B"] // 2 - 5,
-                      cx + w_bg / 2, sg["h"] - sg["B"] // 2 + 11)
-            cv.itemconfigure(sg["dbgd"], state="normal")
-            cv.tag_lower(sg["dbgd"], sg["did"])
+            c2.coords(s2["dbgd"], cx - w_bg / 2,
+                      s2["h"] - s2["B"] // 2 - 5,
+                      cx + w_bg / 2, s2["h"] - s2["B"] // 2 + 11)
+            c2.itemconfigure(s2["dbgd"], state="normal")
+            c2.tag_lower(s2["dbgd"], s2["did"])
 
-        # OHLC 读数（仅跨K线时更新）
         bars = self.view["bars"]
         if idx >= len(bars):
             return
@@ -1345,7 +1340,7 @@ class App:
             f"低{b['low']:.2f} 收{b['close']:.2f} ({chg:+.2f}%) "
             f"量{vol_s}{ind_txt}")
 
-    def _on_leave(self, _event):
+    def _on_leave(self, _event, _key=None):
         self.hover_var.set("")
         self._mtn = None
         for k in ("main", "vol", "ind"):
