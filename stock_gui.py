@@ -846,7 +846,7 @@ class App:
         sb.pack(side="right", fill="y")
         self.txt.config(yscrollcommand=sb.set)
 
-        # 十字光标事件
+        # 十字光标事件（元素在各面板内部，仅坐标移动，无整图重绘）
         self.chart_keys = [("main", self.cv_main), ("vol", self.cv_vol),
                            ("ind", self.cv_ind)]
         for key, cv in self.chart_keys:
@@ -856,7 +856,6 @@ class App:
             cv.bind("<MouseWheel>", self._on_wheel)
             cv.bind("<Button-4>", self._on_wheel)
             cv.bind("<Button-5>", self._on_wheel)
-
     # ---------- 运行分析 ----------
 
     def _run_bg(self, fn, done):
@@ -995,44 +994,47 @@ class App:
         return ymap
 
     def _line(self, cv, xs_fn, vals, ymap, color, width=1):
-        last = None
+        """整条折线一次绘制（None 断开），item 数从 N 段降为少数几条。"""
+        pts = []
+        segs = []
         for i, v in enumerate(vals):
             if v is None:
-                last = None
+                if len(pts) >= 2:
+                    segs.append(list(pts))
+                pts = []
                 continue
-            x, y = xs_fn(i), ymap(v)
-            if last:
-                cv.create_line(last[0], last[1], x, y, fill=color, width=width)
-            last = (x, y)
+            x, yy = xs_fn(i), ymap(v)
+            pts.extend((x, yy))
+        if len(pts) >= 2:
+            segs.append(list(pts))
+        for s in segs:
+            cv.create_line(*s, fill=color, width=width,
+                           joinstyle="round", capstyle="round")
 
     def _finish_panel(self, cv, g, key, lo, hi, dates, fmt=None):
-        """注册缩放信息并创建十字光标元素。"""
+        """登记缩放信息并创建光标元素（层级创建时一次固定）。"""
         g["lo_v"], g["hi_v"] = lo, hi
         g["dates"] = dates
         g["fmt"] = fmt or (lambda v: f"{v:.2f}")
+        g["key"] = key
         self.scales[key] = g
-        cv.delete("cross")
         g["vid"] = cv.create_line(0, 0, 0, 0, state="hidden", fill=CROSS_C,
-                                  dash=(4, 3), tags="cross")
-        g["vid_state"] = "hidden"
+                                  dash=(4, 3))
         g["hid"] = cv.create_line(0, 0, 0, 0, state="hidden", fill=CROSS_C,
-                                  dash=(4, 3), tags="cross")
-        g["pid"] = cv.create_text(g["w"] - g["R"] + 34, 0, text="", state="hidden",
-                                  fill="#fff", font=("Consolas", 8, "bold"),
-                                  tags="cross")
+                                  dash=(4, 3))
+        g["pid"] = cv.create_text(0, 0, text="", state="hidden",
+                                  fill="#ffffff",
+                                  font=("Consolas", 9, "bold"))
         g["pbg"] = cv.create_rectangle(0, 0, 0, 0, state="hidden",
-                                       fill="#1971c2", outline="", tags="cross")
-        g["did"] = cv.create_text(0, g["h"] - g["B"] // 2 + 2, text="", state="hidden",
-                                  fill="#fff", font=("Consolas", 8, "bold"),
-                                  tags="cross")
+                                       fill="#1971c2", outline="")
+        g["did"] = cv.create_text(0, 0, text="", state="hidden",
+                                  fill="#ffffff",
+                                  font=("Consolas", 9, "bold"))
         g["dbgd"] = cv.create_rectangle(0, 0, 0, 0, state="hidden",
-                                        fill="#333c46", outline="", tags="cross")
+                                        fill="#333c46", outline="")
         cv.tag_lower(g["dbgd"], g["did"])
         cv.tag_raise(g["pid"])
-        cv.tag_raise("cross")
         g["_shown"] = False
-
-    # ---------- 主图 ----------
 
     def _draw_main(self):
         cv, v = self.cv_main, self.view
@@ -1066,16 +1068,11 @@ class App:
             up = b["close"] >= b["open"]
             color = PRED_C if isp else (UP if up else DOWN)
             dash = (3, 2) if isp else ()
-            yo, yc = ymap(b["open"]), ymap(b["close"])
-            cv.create_line(x, ymap(b["high"]), x, ymap(b["low"]),
-                           fill=color, dash=dash)
             bw2 = max(g["bw"] * 0.62, 2)
-            ty, by = min(yo, yc), max(yo, yc)
-            if by - ty < 1:
-                by = ty + 1
-            cv.create_rectangle(x - bw2 / 2, ty, x + bw2 / 2, by,
-                                fill="" if isp else color,
-                                outline=color, dash=dash)
+            # 单元素K线：粗竖线同时充当影线+实体（大幅减少画布对象数）
+            cv.create_line(x, ymap(b["high"]), x, ymap(b["low"]),
+                           fill=color, width=max(int(bw2), 1),
+                           capstyle="butt", dash=dash)
 
         for i, day, typ, txt in v["signals"]:
             if i >= len(bars) - 1:
@@ -1128,12 +1125,18 @@ class App:
         def xs(i):
             return g["L"] + g["bw"] * (i + 0.5)
         self._axes(cv, g, lo, hi, lambda x: f"{x/10000:.0f}万", 2)
-        bw2 = max(g["bw"] * 0.62, 2)
+        bw2 = max(g["bw"] * 0.62, 1)
+        up_pts, dn_pts = [], []
         for i, vol in enumerate(vols):
-            c = UP if v["bars"][i]["close"] >= v["bars"][i]["open"] else DOWN
-            y = ymap(vol)
-            cv.create_rectangle(xs(i) - bw2 / 2, y, xs(i) + bw2 / 2, ymap(0),
-                                fill=c, outline=c)
+            pts = up_pts if v["bars"][i]["close"] >= v["bars"][i]["open"] \
+                else dn_pts
+            pts.extend((xs(i), ymap(0), xs(i), ymap(vol)))
+        if up_pts:
+            cv.create_line(*up_pts, fill=UP, width=int(bw2),
+                           capstyle="butt")
+        if dn_pts:
+            cv.create_line(*dn_pts, fill=DOWN, width=int(bw2),
+                           capstyle="butt")
         if len(vols) >= 5:
             mv = sum(vols[-5:]) / 5
             cv.create_line(g["L"], ymap(mv), g["w"] - g["R"], ymap(mv),
@@ -1169,14 +1172,19 @@ class App:
         zero = ymap(0)
         cv.create_line(g["L"], zero, g["w"] - g["R"], zero, fill=GRID_C)
         self._axes(cv, g, lo, hi, "{:.2f}", 2)
-        bw2 = max(g["bw"] * 0.3, 1.5)
+        mbw2 = max(g["bw"] * 0.62, 1)
+        pos_pts, neg_pts = [], []
         for i, hv in enumerate(mh):
             if hv is None:
                 continue
-            c = UP if hv >= 0 else DOWN
-            y = ymap(hv)
-            cv.create_rectangle(xs(i) - bw2, min(y, zero),
-                                xs(i) + bw2, max(y, zero), fill=c, outline=c)
+            pts = pos_pts if hv >= 0 else neg_pts
+            pts.extend((xs(i), zero, xs(i), ymap(hv)))
+        if pos_pts:
+            cv.create_line(*pos_pts, fill=UP, width=int(mbw2),
+                           capstyle="butt")
+        if neg_pts:
+            cv.create_line(*neg_pts, fill=DOWN, width=int(mbw2),
+                           capstyle="butt")
         self._line(cv, xs, dif, ymap, "#e8890c")
         self._line(cv, xs, dea, ymap, "#1971c2")
         lv = lambda arr: [x for x in arr if x is not None]
@@ -1250,31 +1258,17 @@ class App:
     # ---------- 十字光标 ----------
 
     def _on_motion(self, event, key):
-        """十字光标连续跟随鼠标；数据读数吸附最近K线。"""
+        """十字光标：线/标签连续跟随鼠标，数据读数吸附最近K线。"""
         if key not in self.scales or not self.view:
             return
-
-        # 1) 竖线：三面板按原始 x 连续跟随（不吸附）
-        for k in ("main", "vol", "ind"):
-            sg = self.scales.get(k)
-            if not sg:
-                continue
-            cv2 = {"main": self.cv_main, "vol": self.cv_vol,
-                   "ind": self.cv_ind}[k]
-            xv = max(min(event.x, sg["w"] - sg["R"]), sg["L"])
-            cv2.coords(sg["vid"], xv, sg["T"], xv, sg["h"] - sg["B"])
-            cv2.itemconfigure(sg["vid"], state="normal")
-
-        # 2) 悬停面板：横线 + 价格标签逐像素跟随
         sg = self.scales[key]
         cv = {"main": self.cv_main, "vol": self.cv_vol,
               "ind": self.cv_ind}[key]
+
+        # 轻操作：竖线/横线/价格标签逐像素跟随（仅悬停面板，缩小重绘区）
+        xv = max(min(event.x, sg["w"] - sg["R"]), sg["L"])
         y = max(min(event.y, sg["T"] + sg["ph"]), sg["T"])
-        cv.coords(sg["hid"], sg["L"], y, sg["w"] - sg["R"], y)
-        if not sg["_shown"]:
-            for it in ("hid", "pid", "pbg", "did", "dbgd"):
-                cv.itemconfigure(sg[it], state="normal")
-            sg["_shown"] = True
+        cv.coords(sg["vid"], xv, sg["T"] + 2, xv, sg["h"] - sg["B"])
         price = sg["hi_v"] - (y - sg["T"]) / sg["ph"] * (
             sg["hi_v"] - sg["lo_v"])
         fmt = sg.get("fmt")
@@ -1284,29 +1278,30 @@ class App:
         cv.itemconfigure(sg["pid"], text=txt)
         cv.coords(sg["pbg"], px - 27, y - 9, px + 29, y + 9)
 
-        # 3) 吸附数据：仅跨越K线时更新日期标签与 OHLC 读数
+        first = not sg["_shown"]
+        if first:
+            for it in ("vid", "hid", "pid", "pbg"):
+                cv.itemconfigure(sg[it], state="normal")
+            sg["_shown"] = True
+
+        # 吸附数据：仅跨越K线时更新（重操作）
         idx = int((event.x - sg["L"]) / sg["bw"])
         idx = max(0, min(sg["n"] - 1, idx))
-        cx = sg["L"] + sg["bw"] * (idx + 0.5)
         sig = (key, idx)
-        if getattr(self, "_mtn", None) == sig:
+        if getattr(self, "_mtn", None) == sig and not first:
             return
         self._mtn = sig
+        cx = sg["L"] + sg["bw"] * (idx + 0.5)
         date = sg["dates"][idx]
-        dl = date if len(date) <= 10 else date[:10]
+        dl = date[:10]
 
-        for k in ("main", "vol", "ind"):
-            s2 = self.scales.get(k)
-            if not s2:
-                continue
-            c2 = {"main": self.cv_main, "vol": self.cv_vol,
-                  "ind": self.cv_ind}[k]
-            c2.coords(s2["did"], cx, s2["h"] - s2["B"] // 2 + 2)
-            c2.itemconfigure(s2["did"], text=dl)
-            w_bg = len(dl) * 7 + 10
-            c2.coords(s2["dbgd"], cx - w_bg / 2,
-                      s2["h"] - s2["B"] // 2 - 5,
-                      cx + w_bg / 2, s2["h"] - s2["B"] // 2 + 11)
+        c2 = cv
+        c2.coords(sg["did"], cx, sg["h"] - sg["B"] // 2 + 2)
+        c2.itemconfigure(sg["did"], text=dl)
+        w_bg = len(dl) * 7 + 10
+        c2.coords(sg["dbgd"], cx - w_bg / 2,
+                  sg["h"] - sg["B"] // 2 - 5,
+                  cx + w_bg / 2, sg["h"] - sg["B"] // 2 + 11)
 
         bars = self.view["bars"]
         if idx >= len(bars):
@@ -1350,19 +1345,13 @@ class App:
         self._mtn = None
         for k2 in ("main", "vol", "ind"):
             sg2 = self.scales.get(k2)
-            if sg2:
-                sg2["_shown"] = False
-        for k in ("main", "vol", "ind"):
-            sg = self.scales.get(k)
-            if not sg:
+            if not sg2:
                 continue
-            cv = {"main": self.cv_main, "vol": self.cv_vol,
-                  "ind": self.cv_ind}[k]
+            c2 = {"main": self.cv_main, "vol": self.cv_vol,
+                  "ind": self.cv_ind}[k2]
             for it in ("vid", "hid", "pid", "pbg", "did", "dbgd"):
-                if it in sg:
-                    cv.itemconfigure(sg[it], state="hidden")
-
-    # ---------- 文字区 ----------
+                c2.itemconfigure(sg2[it], state="hidden")
+            sg2["_shown"] = False
 
     def _report_text(self):
         res, tp, pred, q = self.res, self.res["t_pred"], self.res["pred"], self.res["quote"]
