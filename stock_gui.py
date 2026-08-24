@@ -1066,7 +1066,7 @@ class App:
         lx = g["L"] + 2
         for nn in sorted(MA_COLORS):
             if self.ma_on[nn].get():
-                cv.create_text(lx, g["h"] - 7, text=f"MA{nn}",
+                cv.create_text(lx, 6, text=f"MA{nn}",
                                fill=MA_COLORS[nn],
                                font=("Consolas", 8, "bold"), anchor="w")
                 lx += 36
