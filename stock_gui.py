@@ -1132,17 +1132,11 @@ class App:
             return g["L"] + g["bw"] * (i + 0.5)
         self._axes(cv, g, lo, hi, lambda x: f"{x/10000:.0f}万", 2)
         bw2 = max(g["bw"] * 0.62, 1)
-        up_pts, dn_pts = [], []
         for i, vol in enumerate(vols):
-            pts = up_pts if v["bars"][i]["close"] >= v["bars"][i]["open"] \
-                else dn_pts
-            pts.extend((xs(i), ymap(0), xs(i), ymap(vol)))
-        if up_pts:
-            cv.create_line(*up_pts, fill=UP, width=int(bw2),
-                           capstyle="butt")
-        if dn_pts:
-            cv.create_line(*dn_pts, fill=DOWN, width=int(bw2),
-                           capstyle="butt")
+            c = UP if v["bars"][i]["close"] >= v["bars"][i]["open"] else DOWN
+            cv.create_rectangle(xs(i) - bw2 / 2, ymap(vol),
+                                xs(i) + bw2 / 2, ymap(0),
+                                fill=c, outline=c)
         if len(vols) >= 5:
             mv = sum(vols[-5:]) / 5
             cv.create_line(g["L"], ymap(mv), g["w"] - g["R"], ymap(mv),
@@ -1178,19 +1172,15 @@ class App:
         zero = ymap(0)
         cv.create_line(g["L"], zero, g["w"] - g["R"], zero, fill=GRID_C)
         self._axes(cv, g, lo, hi, "{:.2f}", 2)
-        mbw2 = max(g["bw"] * 0.62, 1)
-        pos_pts, neg_pts = [], []
+        mbw2 = max(g["bw"] * 0.3, 1.5)
         for i, hv in enumerate(mh):
             if hv is None:
                 continue
-            pts = pos_pts if hv >= 0 else neg_pts
-            pts.extend((xs(i), zero, xs(i), ymap(hv)))
-        if pos_pts:
-            cv.create_line(*pos_pts, fill=UP, width=int(mbw2),
-                           capstyle="butt")
-        if neg_pts:
-            cv.create_line(*neg_pts, fill=DOWN, width=int(mbw2),
-                           capstyle="butt")
+            c = UP if hv >= 0 else DOWN
+            y = ymap(hv)
+            cv.create_rectangle(xs(i) - mbw2, min(y, zero),
+                                xs(i) + mbw2, max(y, zero),
+                                fill=c, outline=c)
         self._line(cv, xs, dif, ymap, "#e8890c")
         self._line(cv, xs, dea, ymap, "#1971c2")
         lv = lambda arr: [x for x in arr if x is not None]
