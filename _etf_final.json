@@ -1,0 +1,200 @@
+[
+ {
+  "code": "sh588000",
+  "name": "科创50ETF",
+  "trades": 4,
+  "winrate": 75.0,
+  "total_pct": 48.6,
+  "ann_pct": 76.4,
+  "mdd_pct": -10.4,
+  "up_prob": 71.4,
+  "regime": "缩量"
+ },
+ {
+  "code": "sh512480",
+  "name": "半导体ETF",
+  "trades": 4,
+  "winrate": 50.0,
+  "total_pct": 31.2,
+  "ann_pct": 47.9,
+  "mdd_pct": -27.0,
+  "up_prob": 75.0,
+  "regime": "缩量"
+ },
+ {
+  "code": "sh515880",
+  "name": "通信ETF",
+  "trades": 5,
+  "winrate": 75.0,
+  "total_pct": 25.7,
+  "ann_pct": 38.7,
+  "mdd_pct": -10.6,
+  "up_prob": 50.0,
+  "regime": "缩量"
+ },
+ {
+  "code": "sh512660",
+  "name": "军工ETF",
+  "trades": 4,
+  "winrate": 50.0,
+  "total_pct": 24.2,
+  "ann_pct": 37.0,
+  "mdd_pct": -8.8,
+  "up_prob": 40.0,
+  "regime": "缩量"
+ },
+ {
+  "code": "sh510500",
+  "name": "中证500ETF",
+  "trades": 4,
+  "winrate": 100.0,
+  "total_pct": 14.7,
+  "ann_pct": 24.4,
+  "mdd_pct": -9.4,
+  "up_prob": 50.0,
+  "regime": "缩量"
+ },
+ {
+  "code": "sh516160",
+  "name": "新能源ETF",
+  "trades": 4,
+  "winrate": 66.7,
+  "total_pct": 9.2,
+  "ann_pct": 12.9,
+  "mdd_pct": -11.4,
+  "up_prob": 44.4,
+  "regime": "缩量"
+ },
+ {
+  "code": "sz159941",
+  "name": "纳指ETF",
+  "trades": 5,
+  "winrate": 40.0,
+  "total_pct": 8.1,
+  "ann_pct": 13.1,
+  "mdd_pct": -12.7,
+  "up_prob": 33.3,
+  "regime": "放量"
+ },
+ {
+  "code": "sz159732",
+  "name": "消费电子ETF",
+  "trades": 5,
+  "winrate": 50.0,
+  "total_pct": 7.8,
+  "ann_pct": 12.9,
+  "mdd_pct": -18.5,
+  "up_prob": 66.7,
+  "regime": "平量"
+ },
+ {
+  "code": "sz159915",
+  "name": "创业板ETF",
+  "trades": 5,
+  "winrate": 50.0,
+  "total_pct": 5.3,
+  "ann_pct": 7.7,
+  "mdd_pct": -12.6,
+  "up_prob": 66.7,
+  "regime": "缩量"
+ },
+ {
+  "code": "sh510300",
+  "name": "沪深300ETF",
+  "trades": 5,
+  "winrate": 40.0,
+  "total_pct": 3.6,
+  "ann_pct": 5.0,
+  "mdd_pct": -5.1,
+  "up_prob": 71.4,
+  "regime": "平量"
+ },
+ {
+  "code": "sz159819",
+  "name": "人工智能ETF",
+  "trades": 4,
+  "winrate": 50.0,
+  "total_pct": 3.1,
+  "ann_pct": 4.7,
+  "mdd_pct": -19.5,
+  "up_prob": 50.0,
+  "regime": "平量"
+ },
+ {
+  "code": "sh510880",
+  "name": "红利ETF",
+  "trades": 5,
+  "winrate": 25.0,
+  "total_pct": 1.6,
+  "ann_pct": 2.2,
+  "mdd_pct": -15.8,
+  "up_prob": 50.0,
+  "regime": "缩量"
+ },
+ {
+  "code": "sh513100",
+  "name": "纳指ETF",
+  "trades": 6,
+  "winrate": 16.7,
+  "total_pct": 1.4,
+  "ann_pct": 2.1,
+  "mdd_pct": -7.9,
+  "up_prob": 66.7,
+  "regime": "平量"
+ },
+ {
+  "code": "sh510050",
+  "name": "上证50ETF",
+  "trades": 6,
+  "winrate": 33.3,
+  "total_pct": 0.4,
+  "ann_pct": 0.5,
+  "mdd_pct": -7.4,
+  "up_prob": 80.0,
+  "regime": "平量"
+ },
+ {
+  "code": "sh512800",
+  "name": "银行ETF",
+  "trades": 6,
+  "winrate": 40.0,
+  "total_pct": -1.6,
+  "ann_pct": -2.6,
+  "mdd_pct": -6.2,
+  "up_prob": 75.0,
+  "regime": "平量"
+ },
+ {
+  "code": "sh512880",
+  "name": "证券ETF",
+  "trades": 4,
+  "winrate": 50.0,
+  "total_pct": -4.6,
+  "ann_pct": -6.5,
+  "mdd_pct": -14.7,
+  "up_prob": 0.0,
+  "regime": "平量"
+ },
+ {
+  "code": "sh512010",
+  "name": "医药ETF",
+  "trades": 5,
+  "winrate": 20.0,
+  "total_pct": -6.0,
+  "ann_pct": -8.4,
+  "mdd_pct": -22.3,
+  "up_prob": 50.0,
+  "regime": "缩量"
+ },
+ {
+  "code": "sh512690",
+  "name": "酒ETF",
+  "trades": 5,
+  "winrate": 20.0,
+  "total_pct": -13.6,
+  "ann_pct": -20.5,
+  "mdd_pct": -24.6,
+  "up_prob": 0.0,
+  "regime": "缩量"
+ }
+]

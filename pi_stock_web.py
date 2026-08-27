@@ -10,12 +10,8 @@
 import argparse
 import math
 import json
-import re
 import time
-import datetime
 import urllib.request
-import urllib.error
-import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -37,222 +33,6 @@ def http_get(url, retries=3, timeout=15):
             last = e
             time.sleep(1.5 * (a + 1))
     raise RuntimeError(f"网络请求失败: {last}")
-
-
-# ---------- 历史K线多源自动换源（腾讯 ifzq 易被反爬 501） ----------
-
-def _http_get_enc(url, enc="utf-8", retries=2, timeout=15, headers=None):
-    """HTTP GET（限流感知）：503/429等只退避重试1次即抛出，快速切源。"""
-    last = None
-    hdr = {"User-Agent": "Mozilla/5.0"}
-    if headers:
-        hdr.update(headers)
-    for a in range(retries):
-        try:
-            req = urllib.request.Request(url, headers=hdr)
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.read().decode(enc, errors="ignore")
-        except Exception as e:
-            last = e
-            code = getattr(e, "code", None)
-            ratelimited = code in (429, 502, 503, 504) if code else \
-                any(c in str(e) for c in ("503", "502", "504", "429"))
-            eff = min(retries, 2) if ratelimited else retries
-            if a + 1 >= eff:
-                break
-            time.sleep(0.8 * (a + 1))
-    raise RuntimeError(f"网络请求失败: {last}")
-
-
-# ---------- 数据源熔断器（针对503限流） ----------
-
-_SRC_CB = {}                    # 源名 -> [连续失败数, 熔断截止时间戳]
-_CB_LOCK = threading.Lock()
-_CB_THRESHOLD = 2               # 连续失败N次触发熔断
-_CB_BASE_COOLDOWN = 60.0        # 首次熔断冷却60秒
-_CB_MAX_COOLDOWN = 600.0        # 冷却上限10分钟
-
-
-def _is_ratelimit_err(e):
-    code = getattr(e, "code", None)
-    if code is not None:
-        return code in (429, 502, 503, 504)
-    s = str(e)
-    return any(c in s for c in ("503", "502", "504", "429"))
-
-
-def _cb_ok(name):
-    st = _SRC_CB.get(name)
-    return not (st and st[1] > 0 and time.time() < st[1])
-
-
-def _cb_record(name, ok, err=None):
-    """成功清零；失败且属503类时，连续≥N次按指数延长冷却(60s→120s→…≤600s)。"""
-    with _CB_LOCK:
-        st = _SRC_CB.setdefault(name, [0, 0.0])
-        if ok:
-            st[0], st[1] = 0, 0.0
-            return
-        st[0] += 1
-        if err is not None and _is_ratelimit_err(err) \
-                and st[0] >= _CB_THRESHOLD:
-            cd = min(_CB_BASE_COOLDOWN *
-                     (2 ** (st[0] - _CB_THRESHOLD)), _CB_MAX_COOLDOWN)
-            st[1] = max(st[1], time.time() + cd)
-
-
-def _code_to_163(full):
-    """sh600519 -> 0600519, sz002241 -> 1002241"""
-    if full.startswith("sh"):
-        return "0" + full[2:]
-    if full.startswith("sz"):
-        return "1" + full[2:]
-    return None
-
-
-def _code_to_em(full):
-    """sh600519 -> 1.600519, sz002241 -> 0.002241"""
-    if full.startswith("sh"):
-        return "1." + full[2:]
-    if full.startswith("sz"):
-        return "0." + full[2:]
-    return None
-
-
-def _kline_tencent(full, count=500):
-    txt = _http_get_enc(
-        KLINE_URL + f"?param={full},day,,,{count},qfq", enc="utf-8")
-    kd = json.loads(txt)
-    d = (kd.get("data") or {}).get(full) or {}
-    bars = d.get("qfqday") or d.get("day") or []
-    out = []
-    for b in bars:
-        try:
-            if float(b[2]) <= 0:
-                continue
-            out.append({"date": b[0], "open": float(b[1]),
-                        "close": float(b[2]), "high": float(b[3]),
-                        "low": float(b[4]), "vol": float(b[5])})
-        except (ValueError, IndexError):
-            continue
-    return out
-
-
-def _kline_163(full, count=500):
-    code163 = _code_to_163(full)
-    if not code163:
-        return []
-    end = datetime.date.today().strftime("%Y%m%d")
-    start = (datetime.date.today()
-             - datetime.timedelta(days=count * 2)).strftime("%Y%m%d")
-    url = (f"http://quotes.money.163.com/service/chddata.html"
-           f"?code={code163}&start={start}&end={end}"
-           f"&fields=TCLOSE;HIGH;LOW;TOPEN;VOTURNOVER")
-    txt = _http_get_enc(url, enc="gbk", retries=2, timeout=15)
-    out = []
-    for line in txt.strip().split("\n"):
-        if not line.strip() or line.startswith("日期"):
-            continue
-        parts = line.strip().split(",")
-        if len(parts) < 7:
-            continue
-        try:
-            date = parts[0].strip().strip("'")
-            close = float(parts[3]) if parts[3].strip() else 0
-            high = float(parts[4]) if parts[4].strip() else 0
-            low = float(parts[5]) if parts[5].strip() else 0
-            opn = float(parts[6]) if parts[6].strip() else 0
-            vol = float(parts[11]) if len(parts) > 11 and parts[11].strip() else 0
-            if close <= 0:
-                continue
-            out.append({"date": date, "open": opn, "close": close,
-                        "high": high, "low": low, "vol": vol})
-        except (ValueError, IndexError):
-            continue
-    out.reverse()
-    return out[:count]
-
-
-def _kline_eastmoney(full, count=500):
-    secid = _code_to_em(full)
-    if not secid:
-        return []
-    url = (f"https://push2his.eastmoney.com/api/qt/stock/kline/get"
-           f"?secid={secid}&fields1=f1,f2,f3"
-           f"&fields2=f51,f52,f53,f54,f55,f56"
-           f"&klt=101&fqt=1&beg=0&end=20500101&lmt={count}")
-    txt = _http_get_enc(url, enc="utf-8", retries=2, timeout=15,
-                        headers={"Referer": "https://quote.eastmoney.com/"})
-    kd = json.loads(txt)
-    klines = (kd.get("data") or {}).get("klines") or []
-    out = []
-    for line in klines:
-        parts = line.split(",")
-        if len(parts) < 6:
-            continue
-        try:
-            close = float(parts[2])
-            if close <= 0:
-                continue
-            out.append({"date": parts[0], "open": float(parts[1]),
-                        "close": close, "high": float(parts[3]),
-                        "low": float(parts[4]), "vol": float(parts[5])})
-        except (ValueError, IndexError):
-            continue
-    return out[:count]
-
-
-def _kline_sina(full, count=500):
-    url = (f"https://quotes.sina.cn/cn/api/json_v2.php/"
-           f"CN_MarketDataService.getKLineData"
-           f"?symbol={full}&scale=240&ma=no&datalen={count}")
-    txt = _http_get_enc(url, enc="utf-8", retries=2, timeout=15,
-                        headers={"Referer": "https://finance.sina.com.cn/"})
-    txt = re.sub(r'(?<=[{,])(\w+):', r'"\1":', txt)
-    bars = json.loads(txt)
-    out = []
-    for b in bars:
-        try:
-            close = float(b.get("close", 0))
-            if close <= 0:
-                continue
-            out.append({"date": b["day"], "open": float(b["open"]),
-                        "close": close, "high": float(b["high"]),
-                        "low": float(b["low"]),
-                        "vol": float(b.get("volume", 0))})
-        except (ValueError, KeyError):
-            continue
-    return out
-
-
-def _kline_multi(full, count=500):
-    """历史K线多源自动换源 + 熔断调度：腾讯 → 东财 → 网易163 → 新浪。
-
-    跳过熔断冷却中的源；全部冷却时对最早解禁的源做半开探测。"""
-    sources = [
-        ("腾讯", lambda: _kline_tencent(full, count)),
-        ("东财", lambda: _kline_eastmoney(full, count)),
-        ("网易163", lambda: _kline_163(full, count)),
-        ("新浪", lambda: _kline_sina(full, count)),
-    ]
-    last_err = None
-    usable = [(n, f) for n, f in sources if _cb_ok(n)]
-    if not usable:
-        probe = min(sources,
-                    key=lambda nf: _SRC_CB.get(nf[0], [0, 0.0])[1])
-        usable = [probe]
-    for name, fetcher in usable:
-        try:
-            rows = fetcher()
-            _cb_record(name, True)
-            if rows and len(rows) >= 20:
-                return rows
-            last_err = RuntimeError(f"{name}返回空K线")
-        except Exception as e:
-            _cb_record(name, False, e)
-            last_err = e
-            continue
-    raise RuntimeError(f"所有数据源均失败: {last_err}")
 
 
 def normalize_code(code):
@@ -280,10 +60,14 @@ def api_data(full):
     quote = {"name": f[1], "price": float(f[3]), "prev_close": float(f[4]),
              "open": float(f[5]), "high": float(f[33]), "low": float(f[34]),
              "time": f[30]}
-    krows = _kline_multi(full, 500)
-    rows = [{"dt": b["date"], "o": b["open"], "c": b["close"],
-             "h": b["high"], "l": b["low"], "v": b["vol"]}
-            for b in krows]
+    kd = json.loads(http_get(KLINE_URL + f"?param={full},day,,,500,qfq"))
+    d = kd.get("data", {}).get(full)
+    if not d:
+        raise ValueError("K线数据获取失败")
+    bars = d.get("qfqday") or d.get("day")
+    rows = [{"dt": b[0], "o": float(b[1]), "c": float(b[2]),
+             "h": float(b[3]), "l": float(b[4]), "v": float(b[5])}
+            for b in bars if float(b[2]) > 0]
     if len(rows) < 130:
         raise ValueError("上市时间太短，样本不足")
     return {
@@ -929,7 +713,15 @@ def _fetch_quote_one(full):
 
 
 def _fetch_kline_rows(full):
-    return _kline_multi(full, 500)
+    kd = json.loads(http_get(
+        KLINE_URL + "?param=" + full + ",day,,,500,qfq", timeout=20))
+    d = kd.get("data", {}).get(full)
+    if not d:
+        raise ValueError("K线数据获取失败")
+    bars = d.get("qfqday") or d.get("day")
+    return [{"date": b[0], "open": float(b[1]), "close": float(b[2]),
+             "high": float(b[3]), "low": float(b[4]), "vol": float(b[5])}
+            for b in bars if float(b[2]) > 0]
 
 
 def _logret(seq):
@@ -1301,7 +1093,6 @@ class Handler(BaseHTTPRequestHandler):
             code = qs.get("code", [DEFAULT_CODE])[0] or DEFAULT_CODE
             try:
                 res = analyze_server(normalize_code(code))
-                text = res["text"] if isinstance(res, dict) else str(res)
                 img_tag = ('<img src="/svg?code=' + code +
                            '" style="max-width:100%" alt="K线图">')
                 body = ("<html><head><meta charset='utf-8'>"
@@ -1310,7 +1101,7 @@ class Handler(BaseHTTPRequestHandler):
                         "<body style='font-family:Arial;font-size:15px;'>"
                         "<div>" + img_tag + "</div>"
                         "<pre style='white-space:pre-wrap;font-size:15px;"
-                        "line-height:1.6'>" + text +
+                        "line-height:1.6'>" + res +
                         "</pre><p><a href='/lite?code=" + code + "'>图形版</a>"
                         " | <a href='/'>完整版</a> | "
                         "<a href='/text?code=000725'>京东方A</a></p></body>"
