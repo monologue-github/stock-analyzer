@@ -541,10 +541,11 @@ def _code_to_em(full):
     return None
 
 
-def _fetch_tencent(full, count=600):
-    """腾讯K线（原接口，IP可能被限流）"""
-    txt = _http_get(KLINE_URL + f"?param={full},day,,,{count},qfq",
-                   decode="utf-8", retries=1, timeout=8)
+def _fetch_tencent(full, count=600, host=None):
+    """腾讯K线。host 可换备用域名（主域被限流时走代理域/HTTP域）。"""
+    host = host or KLINE_URL
+    txt = _http_get(host + f"?param={full},day,,,{count},qfq",
+                    decode="utf-8", retries=1, timeout=8)
     kd = json.loads(txt)
     d = (kd.get("data") or {}).get(full) or {}
     bars = d.get("qfqday") or d.get("day") or []
@@ -679,6 +680,13 @@ def _fetch_remote_rows(full, count=600):
        失败立刻切下一源，避免整体请求被单源拖死。"""
     sources = [
         ("腾讯", lambda: _fetch_tencent(full, count)),
+        ("腾讯代理", lambda: _fetch_tencent(
+            full, count,
+            "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/"
+            "fqkline/get")),
+        ("腾讯HTTP", lambda: _fetch_tencent(
+            full, count,
+            "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get")),
         ("东财", lambda: _fetch_eastmoney(full, count)),
         ("网易163", lambda: _fetch_163(full, count)),
         ("新浪", lambda: _fetch_sina(full, count)),
@@ -764,10 +772,23 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
         remote = _fetch_remote_rows(full)
     except Exception as e:
         log.warning("get_daily 首次拉取失败 %s: %s", full, e)
+        # 失败退避：已有负缓存记录的代码（反复失败），时长翻倍，
+        # 上限24h，避免样本池里拉不到的代码每天反复撞限流
+        new_ttl = FAIL_TTL
+        try:
+            with db_conn() as conn:
+                row = conn.execute("SELECT ts FROM failed WHERE code=?",
+                                   (full,)).fetchone()
+            if row:
+                prev_ttl = max(FAIL_TTL - (time.time() - row[0]), FAIL_TTL)
+                new_ttl = min(prev_ttl * 2, 86400)
+        except Exception:
+            log.exception("负缓存退避计算失败(忽略)")
         with db_conn(commit=True) as conn:
+            # 存 ts 使 ts+FAIL_TTL = now+new_ttl，无需改表结构
             conn.execute(
                 "INSERT OR REPLACE INTO failed(code,ts,reason) VALUES(?,?,?)",
-                (full, time.time(), str(e)[:120]))
+                (full, time.time() - (FAIL_TTL - new_ttl), str(e)[:120]))
         raise
     with db_conn(commit=True) as conn:
         conn.execute("DELETE FROM failed WHERE code=?", (full,))
