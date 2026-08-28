@@ -2889,8 +2889,6 @@ class App:
                        command=self.copy_report).pack(side="left", padx=2)
             ttk.Button(top, text="导出报告",
                        command=self.export_report).pack(side="left", padx=2)
-            ttk.Button(top, text="邮件",
-                       command=self.mail_report).pack(side="left", padx=2)
             ttk.Button(top, text="样本明细",
                        command=self.show_samples).pack(side="left", padx=2)
             if CACHE_OK:
