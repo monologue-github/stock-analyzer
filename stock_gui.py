@@ -98,6 +98,17 @@ class CFG:
     WEAK_SEC_TH = -2.0                  # 板块弱势阈值(%)
     BAND_FIT_MIN = 60.0                 # 波段适合度门槛
     PRED_MAX_DAYS = 10                  # 多日预测天数
+    # 各技术维度在信号打分中的权重（1.0=标准；<1 降权、>1 升权）
+    IND_W = {
+        "MACD": 1.1,        # 趋势主指标，加权
+        "KDJ": 0.9,         # 摆动指标，略降权（横盘易钝化）
+        "RSI": 0.9,         # 同上
+        "量价": 1.0,
+        "MA20": 1.0,
+        "筹码": 0.8,
+        "布林带": 0.8,      # 均值回归维度，震荡市才准，降权
+        "ADX": 0.8,         # 趋势强度过滤器维度
+    }
 
 
 W_WINDOW: int = CFG.W_WINDOW
@@ -1485,6 +1496,48 @@ def calc_chips(rows, cur_price=None, nbin=120):
             "cur": cur_price}
 
 
+def calc_adx(rows, n=14):
+    """DMI/ADX：+DI、-DI、ADX(n=14)。
+    返回 (pdi, mdi, adx) 三条序列，预热期(2n左右)为 None。"""
+    m = len(rows)
+    pdi = [None] * m
+    mdi = [None] * m
+    adx = [None] * m
+    if m < 2 * n + 1:
+        return pdi, mdi, adx
+    tr_s = pdm_s = ndm_s = 0.0
+    dxs = []
+    for i in range(1, m):
+        h, l = rows[i]["high"], rows[i]["low"]
+        hp, lp = rows[i - 1]["high"], rows[i - 1]["low"]
+        pc = rows[i - 1]["close"]
+        up = h - hp
+        dn = lp - l
+        pdm = up if (up > dn and up > 0) else 0.0
+        ndm = dn if (dn > up and dn > 0) else 0.0
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        if i <= n:
+            tr_s += tr
+            pdm_s += pdm
+            ndm_s += ndm
+        else:
+            # Wilder 平滑
+            tr_s = tr_s - tr_s / n + tr
+            pdm_s = pdm_s - pdm_s / n + pdm
+            ndm_s = ndm_s - ndm_s / n + ndm
+        if i >= n and tr_s > 0:
+            pdi[i] = 100.0 * pdm_s / tr_s
+            mdi[i] = 100.0 * ndm_s / tr_s
+            s = pdi[i] + mdi[i]
+            dxs.append(100.0 * abs(pdi[i] - mdi[i]) / s if s > 0 else 0.0)
+            if len(dxs) >= n:
+                if adx[i - 1] is None:
+                    adx[i] = sum(dxs[-n:]) / n
+                else:
+                    adx[i] = (adx[i - 1] * (n - 1) + dxs[-1]) / n
+    return pdi, mdi, adx
+
+
 def calc_boll(closes, n=20, k=2.0):
     """布林带：中轨=n日SMA，上下轨=中轨±k倍标准差。
     返回 (mid, up, low) 三条序列，预热期为 None。"""
@@ -2334,6 +2387,7 @@ def analyze(full, progress=None, quick=False):
     k_, d_, j_ = calc_kdj(disp_rows)
     r6, r12 = calc_rsi(closes_i, 6), calc_rsi(closes_i, 12)
     b_mid, b_up, b_low = calc_boll(closes_i)
+    pdi_a, mdi_a, adx_a = calc_adx(disp_rows)
     mas = {n: sma_period(closes_i, n) for n in MA_COLORS}
 
     signals = []
@@ -2354,86 +2408,86 @@ def analyze(full, progress=None, quick=False):
             continue
         sc = 0
         reasons = []
-        # MACD
+
+        def _wadd(dim, pts, reason=None):
+            """按 CFG.IND_W 权重加权计分（四舍五入取整，保留符号）。"""
+            nonlocal sc
+            sc += int(round(pts * CFG.IND_W.get(dim, 1.0)))
+            if reason and pts:
+                reasons.append(reason)
+
+        # MACD（权重1.1：趋势主指标）
         if dif[i - 1] <= dea[i - 1] and dif[i] > dea[i]:
-            sc += 2
-            reasons.append("MACD金叉")
+            _wadd("MACD", 2, "MACD金叉")
         elif dif[i - 1] >= dea[i - 1] and dif[i] < dea[i]:
-            sc -= 2
-            reasons.append("MACD死叉")
+            _wadd("MACD", -2, "MACD死叉")
         elif dif[i] > dea[i]:
-            sc += 1
-            reasons.append("DIF>DEA")
+            _wadd("MACD", 1, "DIF>DEA")
         else:
-            sc -= 1
-            reasons.append("DIF<DEA")
-        # KDJ
+            _wadd("MACD", -1, "DIF<DEA")
+        # KDJ（权重0.9：摆动指标，横盘易钝化）
         if k_[i - 1] <= d_[i - 1] and k_[i] > d_[i] and k_[i] < 45:
-            sc += 2
-            reasons.append("KDJ低位金叉")
+            _wadd("KDJ", 2, "KDJ低位金叉")
         elif k_[i - 1] >= d_[i - 1] and k_[i] < d_[i] and k_[i] > 65:
-            sc -= 2
-            reasons.append("KDJ高位死叉")
+            _wadd("KDJ", -2, "KDJ高位死叉")
         elif k_[i] > d_[i]:
-            sc += 1
+            _wadd("KDJ", 1)
         else:
-            sc -= 1
-        # RSI
+            _wadd("KDJ", -1)
+        # RSI（权重0.9）
         if r6[i] is not None and r6[i - 1] is not None:
             if r6[i - 1] < 20 and r6[i] >= 20:
-                sc += 2
-                reasons.append("RSI超卖回升")
+                _wadd("RSI", 2, "RSI超卖回升")
             elif r6[i - 1] > 80 and r6[i] <= 80:
-                sc -= 2
-                reasons.append("RSI超买回落")
+                _wadd("RSI", -2, "RSI超买回落")
             elif r6[i] < 30:
-                sc += 1
+                _wadd("RSI", 1)
             elif r6[i] > 70:
-                sc -= 1
-        # 量价
+                _wadd("RSI", -1)
+        # 量价（权重1.0）
         c, cp = disp_rows[i]["close"], disp_rows[i - 1]["close"]
         v5 = sum(vols_d[max(0, i - 5):i]) / max(1, min(5, i))
         vr_d = vols_d[i] / v5 if v5 > 0 else 0.0
         if vr_d > 1.5 and c > cp:
-            sc += 1
-            reasons.append("放量上涨")
+            _wadd("量价", 1, "放量上涨")
         elif vr_d > 1.5 and c < cp:
-            sc -= 1
-            reasons.append("放量下跌")
-        # MA20趋势
+            _wadd("量价", -1, "放量下跌")
+        # MA20趋势（权重1.0）
         ma20, ma20p = mas[20][i], mas[20][i - 1]
         if ma20 and ma20p:
             if c > ma20 and ma20 > ma20p:
-                sc += 1
+                _wadd("MA20", 1)
             elif c < ma20 and ma20 < ma20p:
-                sc -= 1
-        # 筹码
+                _wadd("MA20", -1)
+        # 筹码（权重0.8）
         snap = chip_snaps.get(disp_rows[i]["date"])
         if snap:
             sup_i, res_i = snap[0], snap[1]
             if sup_i and c <= sup_i * 1.01:
-                sc += 1
-                reasons.append("贴近支撑")
+                _wadd("筹码", 1, "贴近支撑")
             elif res_i and c >= res_i * 0.99:
-                sc -= 1
-                reasons.append("贴近压力")
-        # 布林带：均值回归参考（下轨超卖偏多 / 上轨超买偏空）
+                _wadd("筹码", -1, "贴近压力")
+        # 布林带（权重0.8：均值回归参考，震荡市才准）
         bu_i, bl_i = b_up[i], b_low[i]
         if None not in (bu_i, bl_i):
             if c < bl_i:
-                sc += 1
-                reasons.append("布林下轨超卖")
+                _wadd("布林带", 1, "布林下轨超卖")
             elif c > bu_i:
-                sc -= 1
-                reasons.append("布林上轨超买")
+                _wadd("布林带", -1, "布林上轨超买")
             elif (disp_rows[i - 1]["close"] <= (b_low[i - 1] or 0)
                     and c > bl_i):
-                sc += 1
-                reasons.append("布林下轨回升")
+                _wadd("布林带", 1, "布林下轨回升")
             elif (disp_rows[i - 1]["close"] >= (b_up[i - 1] or 1e18)
                     and c < bu_i):
-                sc -= 1
-                reasons.append("布林上轨回落")
+                _wadd("布林带", -1, "布林上轨回落")
+        # ADX（权重0.8：趋势强度过滤——只有 ADX≥20 趋势成立时，
+        # DI 方向才计分；横盘时不贡献分数）
+        a_i, p_i, m_i = adx_a[i], pdi_a[i], mdi_a[i]
+        if None not in (a_i, p_i, m_i) and a_i >= 20:
+            if p_i > m_i:
+                _wadd("ADX", 1, "ADX趋势偏多" if a_i >= 25 else None)
+            elif m_i > p_i:
+                _wadd("ADX", -1, "ADX趋势偏空" if a_i >= 25 else None)
         # 统计样本维度不放历史打分：今日匹配样本不能用于标注过去（防前视）
         # 最新一天的样本倾向已由综合评估中的"统计预测"维度体现
         _bull_scores.append((i, disp_rows[i]["date"], sc, reasons))
@@ -2580,6 +2634,18 @@ def analyze(full, progress=None, quick=False):
             else:
                 items.append(("布林带", 0,
                               f"中轨{bm_i:.2f}附近 方向不明"))
+        # ADX：趋势强度
+        a_i, p_i, m_i = adx_a[i], pdi_a[i], mdi_a[i]
+        if None not in (a_i, p_i, m_i):
+            if a_i >= 25:
+                items.append(("ADX", 1 if p_i > m_i else -1,
+                              f"ADX={a_i:.0f} 强趋势"
+                              f"{'偏多' if p_i > m_i else '偏空'}"))
+            elif a_i >= 20:
+                items.append(("ADX", 1 if p_i > m_i else -1 if p_i != m_i else 0,
+                              f"ADX={a_i:.0f} 趋势形成中"))
+            else:
+                items.append(("ADX", 0, f"ADX={a_i:.0f} 无趋势震荡"))
         up_p = t_pred["up_prob"]
         if up_p >= 0.55:
             items.append(("统计预测", 1, f"上行概率{up_p*100:.0f}%"))
@@ -2606,7 +2672,9 @@ def analyze(full, progress=None, quick=False):
             avg1 = sum(x["n1_cl"] for x in samples if x.get("n1_cl") is not None) / len(samples)
             items.append(("相似样本", 1 if avg1 > 0 else -1,
                           f"次日均涨跌{avg1*100:+.1f}%"))
-        score = sum(s for _, s, _ in items)
+        # 各维度加权求和（权重与信号打分共用 CFG.IND_W）
+        score = sum(int(round(s * CFG.IND_W.get(lab, 1.0)))
+                    for lab, s, _ in items)
         if score >= 4:
             verdict = "多维共振偏多·买点参考"
         elif score >= 2:
@@ -2649,7 +2717,7 @@ def analyze(full, progress=None, quick=False):
         "sector_name": sec_name, "sector_chg_today": sec_chg_today,
         "ind": {"ma": mas, "dif": dif, "dea": dea, "mhist": mhist,
                 "k": k_, "d": d_, "j": j_, "rsi6": r6, "rsi12": r12,
-                "boll_mid": b_mid, "boll_up": b_up, "boll_low": b_low},
+                "boll_mid": b_mid, "boll_up": b_up, "boll_low": b_low, "pdi": pdi_a, "mdi": mdi_a, "adx": adx_a},
         "vols": vols,
         "chips": chips,
         "action": action,
@@ -2703,7 +2771,7 @@ def slice_view(res, show_n, pan=0):
         "rsi6": res["ind"]["rsi6"][off:end], "rsi12": res["ind"]["rsi12"][off:end],
         "boll_mid": res["ind"]["boll_mid"][off:end],
         "boll_up": res["ind"]["boll_up"][off:end],
-        "boll_low": res["ind"]["boll_low"][off:end],
+        "boll_low": res["ind"]["boll_low"][off:end], "pdi": res["ind"]["pdi"][off:end], "mdi": res["ind"]["mdi"][off:end], "adx": res["ind"]["adx"][off:end],
         "vols": res["vols"][off:end] + [None],
         "signals": [(i - off, dt, t, txt) for i, dt, t, txt in res["signals"]
                     if off <= i < end],
@@ -2943,7 +3011,7 @@ class App:
             cb.bind("<<ComboboxSelected>>", lambda e: self._rerender())
             ttk.Label(top2, text="副图:").pack(side="left")
             ci = ttk.Combobox(top2, textvariable=self.ind_name, width=5,
-                              state="readonly", values=["MACD", "KDJ", "RSI", "BOLL"])
+                              state="readonly", values=["MACD", "KDJ", "RSI", "BOLL", "ADX"])
             ci.pack(side="left", padx=2)
             ci.bind("<<ComboboxSelected>>", lambda e: self._rerender())
             # 小屏：报告/样本/缓存/指数 全部收进【工具】菜单
@@ -2961,7 +3029,7 @@ class App:
             ttk.Label(top, text="副图指标:").pack(side="left")
             ci = ttk.Combobox(top, textvariable=self.ind_name, width=6,
                               state="readonly",
-                              values=["MACD", "KDJ", "RSI", "BOLL"])
+                              values=["MACD", "KDJ", "RSI", "BOLL", "ADX"])
             ci.pack(side="left", padx=3)
             ci.bind("<<ComboboxSelected>>", lambda e: self._rerender())
 
@@ -3469,6 +3537,8 @@ class App:
             self._draw_rsi()
         elif name == "BOLL":
             self._draw_bollpct()
+        elif name == "ADX":
+            self._draw_adx()
         if getattr(self, "side_txt", None):
             self._write_side()
         self._write_report()
@@ -3816,7 +3886,9 @@ class App:
                                          and v.get("chips")))
         pct = []
         for i, b in enumerate(bars):
-            if (None in (up[i], low[i]) or up[i] <= low[i]):
+            if i >= len(up) or None in (up[i], low[i]) or up[i] <= low[i]:
+                pct.append(None)
+                continue
                 pct.append(None)
                 continue
             pct.append(max(-20.0, min(120.0,
@@ -3846,6 +3918,46 @@ class App:
             cv.create_text(xs(i), g["h"] - 7, text=v["dates"][i][5:],
                            font=("Consolas", 7), fill=AXIS_TXT)
         self._finish_panel(cv, g, "ind", -20, 120, v["dates"],
+                           fmt=lambda x: f"{x:.0f}")
+
+    def _draw_adx(self):
+        """DMI/ADX 副图：+DI(橙) / -DI(绿) / ADX(蓝粗)。"""
+        cv, v = self.cv_ind, self.view
+        cv.delete("all")
+        pdi, mdi, adx = v["pdi"], v["mdi"], v["adx"]
+        n = len(v["bars"])
+        g = self._geom(cv, n, chips=bool(self.show_chips.get()
+                                         and v.get("chips")))
+        vals = [x for x in pdi + mdi + adx if x is not None]
+        lo, hi = (0, 60) if not vals else (0, max(60, max(vals) * 1.1))
+
+        def ymap(val):
+            return g["T"] + (hi - val) / (hi - lo) * g["ph"]
+
+        def xs(i):
+            return g["L"] + g["bw"] * (i + 0.5)
+        for gv, sty in ((20, (2, 3)), (25, (4, 3))):
+            cv.create_line(g["L"], ymap(gv), g["w"] - g["R"], ymap(gv),
+                           fill=GUIDE_C, dash=sty)
+            cv.create_text(g["L"] - 4, ymap(gv), text=str(gv),
+                           font=("Consolas", 7), fill=AXIS_TXT, anchor="e")
+        self._axes(cv, g, lo, hi, "{:.0f}", 2)
+        self._line(cv, xs, pdi, ymap, "#e8890c")
+        self._line(cv, xs, mdi, ymap, "#26c281")
+        self._line(cv, xs, adx, ymap, "#1971c2", width=2)
+        lv = lambda arr: [x for x in arr if x is not None]
+        lp_, lm_, la_ = lv(pdi), lv(mdi), lv(adx)
+        info = (f"+DI:{lp_[-1]:.0f} -DI:{lm_[-1]:.0f} ADX:{la_[-1]:.0f}"
+                if lp_ and lm_ and la_ else "")
+        cv.create_text(g["L"] + 2, g["T"] - 3,
+                       text=("ADX/DMI  橙+DI / 绿-DI / 蓝ADX    " + info),
+                       anchor="w", font=("Microsoft YaHei", 8),
+                       fill=TITLE_TXT)
+        step = max(1, n // 10)
+        for i in range(0, n, step):
+            cv.create_text(xs(i), g["h"] - 7, text=v["dates"][i][5:],
+                           font=("Consolas", 7), fill=AXIS_TXT)
+        self._finish_panel(cv, g, "ind", lo, hi, v["dates"],
                            fmt=lambda x: f"{x:.0f}")
 
     def _draw_macd(self):
@@ -4094,6 +4206,33 @@ class App:
         L.append(f"-- {res.get('next_label', '次日(T+1)')}预测 --")
         L.append(f"开 {pred['open']:.2f} | 收 {pred['close']:.2f} | "
                  f"高 {pred['high']:.2f} | 低 {pred['low']:.2f}")
+        # 布林带 / ADX 参考
+        bl_up = next((x for x in reversed(res["ind"]["boll_up"])
+                      if x is not None), None)
+        bl_mid = next((x for x in reversed(res["ind"]["boll_mid"])
+                       if x is not None), None)
+        bl_low = next((x for x in reversed(res["ind"]["boll_low"])
+                       if x is not None), None)
+        if None not in (bl_up, bl_mid, bl_low):
+            pos = ("上轨上方·超买" if q["price"] > bl_up
+                   else "下轨下方·超卖" if q["price"] < bl_low
+                   else "带内")
+            L.append(f"-- 布林带(20,2) --")
+            L.append(f"上轨 {bl_up:.2f} | 中轨 {bl_mid:.2f} | "
+                     f"下轨 {bl_low:.2f} | 现价 {q['price']:.2f} 位于{pos}")
+        _adx = next((x for x in reversed(res["ind"]["adx"])
+                     if x is not None), None)
+        _pdi = next((x for x in reversed(res["ind"]["pdi"])
+                     if x is not None), None)
+        _mdi = next((x for x in reversed(res["ind"]["mdi"])
+                     if x is not None), None)
+        if None not in (_adx, _pdi, _mdi):
+            L.append("-- ADX/DMI(14) --")
+            L.append(f"ADX {_adx:.0f}"
+                     + ("（强趋势）" if _adx >= 25
+                        else "（趋势形成）" if _adx >= 20 else "（无趋势·震荡）")
+                     + f" | +DI {_pdi:.0f} vs -DI {_mdi:.0f}"
+                     + (" 多头占优" if _pdi > _mdi else " 空头占优"))
         sigs = res["signals"]
         L.append(f"-- 近期买卖信号({min(len(sigs),12)}条) --")
         for i, day, typ, txt in sigs[-12:]:
@@ -4177,10 +4316,26 @@ class App:
             p()
             p("■ 布林带(20,2)")
             p(f"  上轨 {bl_up:.2f} | 中轨 {bl_mid:.2f} | 下轨 {bl_low:.2f}")
-            pos = ("上轨上方·超买" if q["price"] > bl_up
-                   else "下轨下方·超卖" if q["price"] < bl_low
+            cur_px = res["quote"]["price"]
+            pos = ("上轨上方·超买" if cur_px > bl_up
+                   else "下轨下方·超卖" if cur_px < bl_low
                    else "带内")
-            p(f"  现价 {q['price']:.2f} 位于{pos}")
+            p(f"  现价 {cur_px:.2f} 位于{pos}")
+        # ADX/DMI 参考
+        _adx = next((x for x in reversed(res["ind"]["adx"])
+                     if x is not None), None)
+        _pdi = next((x for x in reversed(res["ind"]["pdi"])
+                     if x is not None), None)
+        _mdi = next((x for x in reversed(res["ind"]["mdi"])
+                     if x is not None), None)
+        if None not in (_adx, _pdi, _mdi):
+            p()
+            p("■ ADX/DMI(14)")
+            p(f"  ADX {_adx:.0f}"
+              + ("（强趋势）" if _adx >= 25
+                 else "（趋势形成）" if _adx >= 20 else "（无趋势·震荡）")
+              + f" | +DI {_pdi:.0f} vs -DI {_mdi:.0f}"
+              + (" 多头占优" if _pdi > _mdi else " 空头占优"))
         act = res.get("action")
         if act:
             p()
@@ -4577,7 +4732,10 @@ class App:
             f"RSI6={f1(last(ind['rsi6']))} RSI12={f1(last(ind['rsi12']))}\n"
             f"布林带(20,2): 上轨={f3(last(ind['boll_up']))} "
             f"中轨={f3(last(ind['boll_mid']))} 下轨={f3(last(ind['boll_low']))}"
-            f" 现价位于{'上轨上方' if c > (last(ind['boll_up']) or 1e18) else ('下轨下方' if c < (last(ind['boll_low']) or -1) else '带内')}\n\n"
+            f" 现价位于{'上轨上方' if c > (last(ind['boll_up']) or 1e18) else ('下轨下方' if c < (last(ind['boll_low']) or -1) else '带内')}\n"
+            f"ADX/DMI(14): ADX={f1(last(ind['adx']))} "
+            f"+DI={f1(last(ind['pdi']))} -DI={f1(last(ind['mdi']))}"
+            "（ADX≥25强趋势 / <20震荡，DI方向即趋势方向）\n\n"
              f"历史形态统计预测(锚定{res.get('anchor', '今开')})：\n"
             f"今日收盘 P50={tp['cl'][50]:.2f}(P10 {tp['cl'][10]:.2f}/"
             f"P90 {tp['cl'][90]:.2f}) 上行概率{tp['up_prob']*100:.0f}%\n"
