@@ -328,11 +328,17 @@ def _http_get(url, retries=3, timeout=15, decode="utf-8", headers=None,
                 _LAST_REQ[0] = time.time()
             try:
                 req = urllib.request.Request(url, headers=hdr)
-                opener = _PROXY_OPENER
-                if opener is not None:
-                    with opener.open(req, timeout=timeout) as r:
-                        txt = r.read().decode(decode, errors="ignore")
-                else:
+                txt = None
+                if _PROXY_OPENER is not None:
+                    try:
+                        with _PROXY_OPENER.open(req, timeout=timeout) as r:
+                            txt = r.read().decode(decode, errors="ignore")
+                    except Exception as pe:
+                        # 代理不可用（软件未开/节点故障）时自动回退直连，
+                        # 避免配置代理后一个源都拉不到
+                        log.debug("代理请求失败，回退直连 %s: %s",
+                                  url[:80], pe)
+                if txt is None:
                     with urllib.request.urlopen(req, timeout=timeout) as r:
                         txt = r.read().decode(decode, errors="ignore")
                 ok_flag = True
@@ -1278,9 +1284,31 @@ def fetch_sector_context(full):
            "Referer": "https://quote.eastmoney.com/"}
 
     def get(u, timeout=4):
-        # 板块接口统一走熔断 _http_get（东财板块源上报）
-        return _http_get(u, retries=1, timeout=timeout, headers=dict(hdr),
-                         src_name="东财板块")
+        # 东财接口对部分网络直连被重置：按 URL 类型做主机轮询容灾；
+        # 有些主机会返回 200 的反爬 HTML 页，需校验内容是 JSON
+        if "push2his" in u:
+            hosts = ("push2delay.eastmoney.com", "push2his.eastmoney.com",
+                     "92.push2his.eastmoney.com")
+            base = "push2his.eastmoney.com"
+        else:
+            hosts = ("push2delay.eastmoney.com", "push2.eastmoney.com",
+                     "push2his.eastmoney.com")
+            base = "push2.eastmoney.com"
+        last = None
+        for host in hosts:
+            uu = u.replace(base, host)
+            try:
+                txt = _http_get(uu, retries=1, timeout=timeout,
+                                headers=dict(hdr), src_name="东财板块")
+                txt = txt.lstrip("\ufeff")
+                if txt.lstrip().startswith("{"):
+                    return txt
+                last = RuntimeError("反爬HTML页")
+                log.debug("板块接口 %s 返回非JSON", host)
+            except Exception as e:
+                last = e
+                log.debug("板块接口 %s 失败: %s", host, e)
+        raise last
 
     try:
         global _BK_LIST_CACHE, _BK_LIST_TS
@@ -1314,12 +1342,32 @@ def fetch_sector_context(full):
                 bk_code = _BK_LIST_CACHE.get(ind_name)
         if not bk_code:
             return ind_name, {}, None
-        # 3) 板块日K（收盘价）
+        # 3) 板块日K（收盘价）—— 必须带 ut，否则部分主机返回反爬页
         u = (f"https://push2his.eastmoney.com/api/qt/stock/kline/get"
              f"?secid=90.{bk_code}&fields1=f1,f2,f3&fields2=f51,f53"
-             f"&klt=101&fqt=0&beg=20240101&end=20500101")
+             f"&klt=101&fqt=0&beg=20240101&end=20500101&ut={UT}")
         kl = json.loads(get(u, timeout=8))["data"]["klines"]
         bars = [(s.split(",")[0], float(s.split(",")[1])) for s in kl]
+        if not bars:
+            # 部分板块指数日K在部分主机返回空：降级取今日板块涨跌幅
+            # （历史留空，评分按缺数据处理）
+            u3 = (f"https://push2.eastmoney.com/api/qt/clist/get"
+                  f"?pn=1&pz=100&po=1&np=1&fltt=2&invariant=0"
+                  f"&fields=f12,f14,f3&fs=m:90+t:2&ut={UT}")
+            diff = (json.loads(get(u3, timeout=8)).get("data") or {}).get(
+                "diff") or {}
+            items = list(diff.values()) if isinstance(diff, dict) else diff
+            today_chg = None
+            for it in items:
+                if it.get("f12") == bk_code and it.get("f3") is not None:
+                    today_chg = float(it["f3"])
+                    break
+            log.info("板块 %s(%s) 日K为空，降级仅用今日涨跌 %s",
+                     ind_name, bk_code, today_chg)
+            with _STATE_LOCK:
+                _SECTOR_CACHE[full] = (time.time(),
+                                       (ind_name, {}, today_chg))
+            return ind_name, {}, today_chg
         chg_by_date = {
             b[0]: (b[1] / a[1]) * 100 - 100
             for a, b in zip(bars, bars[1:])
