@@ -988,10 +988,12 @@ _TIER_POOL_CACHE = {}       # (tier, 日期) -> L3样本代码列表（同日共
 _TIER_POOL_TS = {}
 
 
-def tier_sample(full: str, n: int = L3_DEFAULT_N, exclude_industries=()):
-    """L3池：同市值层抽样，同一市值层当天共享同一份样本（避免每只股票
-    各自随机抽样导致大量重复拉取/缓存膨胀）。
-    用 (tier, 日期) 做共享缓存键，当天首次计算后缓存复用。
+def tier_sample(full: str, n: int = 0, exclude_industries=()):
+    """L3池：同市值层样本，**缓存优先、不固定数量**。
+
+    - 命中本地缓存的同层代码排前面（分析立刻可用）；
+    - 未缓存的排后面，由后台渐进回填，拉到多少用多少；
+    - 不再固定截取 N 只（n<=0 时返回全层）。
     缓存读写全程持有 _STATE_LOCK，多线程下不会互相污染。"""
     info = get_stock_info(full)
     if not info or not info.get("tier"):
@@ -1011,9 +1013,15 @@ def tier_sample(full: str, n: int = L3_DEFAULT_N, exclude_industries=()):
                 q = ("SELECT code,industry FROM stocks "
                      "WHERE tier=? AND code NOT LIKE 'bj%'")
                 rows = conn.execute(q, (tier,)).fetchall()
+                have = {r[0] for r in conn.execute(
+                    "SELECT DISTINCT code FROM daily_bars").fetchall()}
+            # 缓存优先：已回填过日K的排前面，其余排后面
             rnd = random.Random(today + tier)
-            rnd.shuffle(rows)
-            pool = rows[:n]
+            head = [r for r in rows if r[0] in have]
+            tail = [r for r in rows if r[0] not in have]
+            rnd.shuffle(head)
+            rnd.shuffle(tail)
+            pool = head + tail
             _TIER_POOL_CACHE[key] = pool
             _TIER_POOL_TS[key] = now
     # 排除自身与 L2 已覆盖的行业（industry 名字，非代码）
@@ -1021,11 +1029,13 @@ def tier_sample(full: str, n: int = L3_DEFAULT_N, exclude_industries=()):
     if exclude:
         pool = [r for r in pool if (r[1] or "") not in exclude]
     out = [c for c, _ in pool if c != full]
-    return out[:n], tier
+    if n and n > 0:
+        out = out[:n]
+    return out, tier
 
 
-def pool_codes(full, l2_n=L2_DEFAULT_N, l3_n=L3_DEFAULT_N):
-    """一次拿到两级样本池。"""
+def pool_codes(full, l2_n=L2_DEFAULT_N, l3_n=0):
+    """一次拿到两级样本池。l3_n<=0 表示 L3 不限量（缓存优先排序）。"""
     peers, industry = industry_peers(full, l2_n)
     l3, tier = tier_sample(full, l3_n, exclude_industries=(industry,))
     seen = {full}
@@ -2035,6 +2045,7 @@ def load_pools_progressive(full, ctx, progress=None, batch=12):
             continue
         t0 = time.time()
         acc_rows = []       # 本级的累计池K线，逐批变大，匹配随之变准
+        matched_n = 0       # 上次跑匹配时的池大小（自适应降频）
         for i in range(0, len(codes), batch):
             chunk = codes[i:i + batch]
             try:
@@ -2048,6 +2059,10 @@ def load_pools_progressive(full, ctx, progress=None, batch=12):
             except Exception:
                 cached = {}
             acc_rows += [(c, r) for c, r in cached.items() if len(r) >= 130]
+            # 池大了以后每批全量匹配太慢：新增≥24只有效K线才重跑一次
+            if len(acc_rows) < matched_n + 24:
+                continue
+            matched_n = len(acc_rows)
             # 用已累计的全部本池K线跑匹配，样本随加载增多而变准
             try:
                 smp = _pool_match(acc_rows, ctx["cur"], ctx["vr_now"],
@@ -2070,7 +2085,7 @@ def load_pools_progressive(full, ctx, progress=None, batch=12):
                           for k, v in sorted(level_map.items()) if v]
                 pool_note = "样本池: " + "+".join(parts)
                 yield level_map, t_pred, pred, clamped, tpred_bar, pool_note, multi_pred
-            if time.time() - t0 > 40:   # 单级超时保护
+            if time.time() - t0 > 60:   # 单级超时保护（L3不限量后池更大）
                 break
 
 
