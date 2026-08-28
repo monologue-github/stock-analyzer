@@ -1485,6 +1485,21 @@ def calc_chips(rows, cur_price=None, nbin=120):
             "cur": cur_price}
 
 
+def calc_boll(closes, n=20, k=2.0):
+    """布林带：中轨=n日SMA，上下轨=中轨±k倍标准差。
+    返回 (mid, up, low) 三条序列，预热期为 None。"""
+    mid = sma_period(closes, n)
+    up = [None] * len(closes)
+    low = [None] * len(closes)
+    for i in range(n - 1, len(closes)):
+        seg = closes[i - n + 1:i + 1]
+        m = mid[i]
+        sd = (sum((x - m) ** 2 for x in seg) / n) ** 0.5
+        up[i] = m + k * sd
+        low[i] = m - k * sd
+    return mid, up, low
+
+
 def _band_fit_score(rows, mas, vr_arr):
     """波段适合度评分（0-100）：用实时技术特征判断该股是否适合做短线波段。
 
@@ -2318,6 +2333,7 @@ def analyze(full, progress=None, quick=False):
     dif, dea, mhist = calc_macd(closes_i)
     k_, d_, j_ = calc_kdj(disp_rows)
     r6, r12 = calc_rsi(closes_i, 6), calc_rsi(closes_i, 12)
+    b_mid, b_up, b_low = calc_boll(closes_i)
     mas = {n: sma_period(closes_i, n) for n in MA_COLORS}
 
     signals = []
@@ -2401,6 +2417,23 @@ def analyze(full, progress=None, quick=False):
             elif res_i and c >= res_i * 0.99:
                 sc -= 1
                 reasons.append("贴近压力")
+        # 布林带：均值回归参考（下轨超卖偏多 / 上轨超买偏空）
+        bu_i, bl_i = b_up[i], b_low[i]
+        if None not in (bu_i, bl_i):
+            if c < bl_i:
+                sc += 1
+                reasons.append("布林下轨超卖")
+            elif c > bu_i:
+                sc -= 1
+                reasons.append("布林上轨超买")
+            elif (disp_rows[i - 1]["close"] <= (b_low[i - 1] or 0)
+                    and c > bl_i):
+                sc += 1
+                reasons.append("布林下轨回升")
+            elif (disp_rows[i - 1]["close"] >= (b_up[i - 1] or 1e18)
+                    and c < bu_i):
+                sc -= 1
+                reasons.append("布林上轨回落")
         # 统计样本维度不放历史打分：今日匹配样本不能用于标注过去（防前视）
         # 最新一天的样本倾向已由综合评估中的"统计预测"维度体现
         _bull_scores.append((i, disp_rows[i]["date"], sc, reasons))
@@ -2408,8 +2441,10 @@ def analyze(full, progress=None, quick=False):
     # 方向切换触发：多头得分≥2且前一次信号为空头→BUY；空头得分≤-2且前一次为多头→SELL
     prev_dir = 0   # 0=无信号, 1=多头, -1=空头
     cooldown = 0
-    _bear_words = {"DIF<DEA", "放量下跌", "贴近压力"}
-    _bull_words = {"DIF>DEA", "放量上涨", "贴近支撑"}
+    _bear_words = {"DIF<DEA", "放量下跌", "贴近压力",
+                   "布林上轨超买", "布林上轨回落"}
+    _bull_words = {"DIF>DEA", "放量上涨", "贴近支撑",
+                   "布林下轨超卖", "布林下轨回升"}
 
     def _weak_day(day):
         """该交易日的市场是否弱势——只用当日(及以前)的大盘/板块数据，
@@ -2525,6 +2560,26 @@ def analyze(full, progress=None, quick=False):
                 items.append(("筹码", -1, f"贴近压力{res_i:.2f}"))
             elif chips["p5"] <= c <= chips["p95"]:
                 items.append(("筹码", 0, "处于筹码密集区中部"))
+        # 布林带：位置 + 中轨方向
+        bu_i, bl_i, bm_i = b_up[i], b_low[i], b_mid[i]
+        if None not in (bu_i, bl_i, bm_i):
+            bm_p = b_mid[i - 1] if i else None
+            mid_up = (bm_p is not None and bm_i > bm_p)
+            if c > bu_i:
+                items.append(("布林带", -1,
+                              f"高于上轨{bu_i:.2f} 超买注意回落"))
+            elif c < bl_i:
+                items.append(("布林带", 1,
+                              f"低于下轨{bl_i:.2f} 超卖关注反弹"))
+            elif c > bm_i and mid_up:
+                items.append(("布林带", 1,
+                              f"中轨{bm_i:.2f}上方且中轨向上"))
+            elif c < bm_i and not mid_up:
+                items.append(("布林带", -1,
+                              f"中轨{bm_i:.2f}下方且中轨向下"))
+            else:
+                items.append(("布林带", 0,
+                              f"中轨{bm_i:.2f}附近 方向不明"))
         up_p = t_pred["up_prob"]
         if up_p >= 0.55:
             items.append(("统计预测", 1, f"上行概率{up_p*100:.0f}%"))
@@ -2593,7 +2648,8 @@ def analyze(full, progress=None, quick=False):
         "cur_regime": cur_regime,
         "sector_name": sec_name, "sector_chg_today": sec_chg_today,
         "ind": {"ma": mas, "dif": dif, "dea": dea, "mhist": mhist,
-                "k": k_, "d": d_, "j": j_, "rsi6": r6, "rsi12": r12},
+                "k": k_, "d": d_, "j": j_, "rsi6": r6, "rsi12": r12,
+                "boll_mid": b_mid, "boll_up": b_up, "boll_low": b_low},
         "vols": vols,
         "chips": chips,
         "action": action,
@@ -2645,6 +2701,9 @@ def slice_view(res, show_n, pan=0):
         "k": res["ind"]["k"][off:end], "d": res["ind"]["d"][off:end],
         "j": res["ind"]["j"][off:end],
         "rsi6": res["ind"]["rsi6"][off:end], "rsi12": res["ind"]["rsi12"][off:end],
+        "boll_mid": res["ind"]["boll_mid"][off:end],
+        "boll_up": res["ind"]["boll_up"][off:end],
+        "boll_low": res["ind"]["boll_low"][off:end],
         "vols": res["vols"][off:end] + [None],
         "signals": [(i - off, dt, t, txt) for i, dt, t, txt in res["signals"]
                     if off <= i < end],
@@ -2884,7 +2943,7 @@ class App:
             cb.bind("<<ComboboxSelected>>", lambda e: self._rerender())
             ttk.Label(top2, text="副图:").pack(side="left")
             ci = ttk.Combobox(top2, textvariable=self.ind_name, width=5,
-                              state="readonly", values=["MACD", "KDJ", "RSI"])
+                              state="readonly", values=["MACD", "KDJ", "RSI", "BOLL"])
             ci.pack(side="left", padx=2)
             ci.bind("<<ComboboxSelected>>", lambda e: self._rerender())
             # 小屏：报告/样本/缓存/指数 全部收进【工具】菜单
@@ -2902,7 +2961,7 @@ class App:
             ttk.Label(top, text="副图指标:").pack(side="left")
             ci = ttk.Combobox(top, textvariable=self.ind_name, width=6,
                               state="readonly",
-                              values=["MACD", "KDJ", "RSI"])
+                              values=["MACD", "KDJ", "RSI", "BOLL"])
             ci.pack(side="left", padx=3)
             ci.bind("<<ComboboxSelected>>", lambda e: self._rerender())
 
@@ -3406,8 +3465,10 @@ class App:
             self._draw_macd()
         elif name == "KDJ":
             self._draw_kdj()
-        else:
+        elif name == "RSI":
             self._draw_rsi()
+        elif name == "BOLL":
+            self._draw_bollpct()
         if getattr(self, "side_txt", None):
             self._write_side()
         self._write_report()
@@ -3565,6 +3626,15 @@ class App:
         if v.get("tpred"):
             los.append(v["tpred"]["low"])
             his.append(v["tpred"]["high"])
+        # 布林带叠加：副图指标选 BOLL 时轨道纳入纵轴范围
+        show_boll = (self.ind_name.get() == "BOLL"
+                     and v.get("boll_up") is not None)
+        if show_boll:
+            for arr in (v["boll_up"], v["boll_low"]):
+                vals = [x for x in arr if x is not None]
+                if vals:
+                    los.append(min(vals))
+                    his.append(max(vals))
         lo, hi = self._pad_range(min(los), max(his))
 
         def ymap(val):
@@ -3577,6 +3647,14 @@ class App:
         for nn in sorted(MA_COLORS):
             if self.ma_on[nn].get():
                 self._line(cv, xs, v["ma"][nn], ymap, MA_COLORS[nn])
+
+        if show_boll:
+            self._line(cv, xs, v["boll_up"], ymap, "#e8a838")
+            self._line(cv, xs, v["boll_low"], ymap, "#e8a838")
+            self._line(cv, xs, v["boll_mid"], ymap, "#9a76d0")
+            cv.create_text(g["w"] - 6, g["T"] - 3, text="BOLL(20,2)",
+                           fill="#e8a838", font=("Consolas", 8, "bold"),
+                           anchor="e")
 
         # 筹码峰：独立右列，只画可见价格区间的bin，均匀排列
         if has_chips:
@@ -3726,6 +3804,49 @@ class App:
                            fmt=lambda v: fmt_vol_cn(v) + "手")
 
     # ---------- 可选指标 ----------
+
+    def _draw_bollpct(self):
+        """布林带 %B：收盘在带内的位置（0=下轨 100=上轨），20/80 为阈值。"""
+        cv, v = self.cv_ind, self.view
+        cv.delete("all")
+        up, low, mid = v["boll_up"], v["boll_low"], v["boll_mid"]
+        bars = v["bars"]
+        n = len(bars)
+        g = self._geom(cv, n, chips=bool(self.show_chips.get()
+                                         and v.get("chips")))
+        pct = []
+        for i, b in enumerate(bars):
+            if (None in (up[i], low[i]) or up[i] <= low[i]):
+                pct.append(None)
+                continue
+            pct.append(max(-20.0, min(120.0,
+                         (b["close"] - low[i]) / (up[i] - low[i]) * 100)))
+
+        def ymap(val):
+            return g["T"] + (100 - val) / 140 * g["ph"]
+
+        def xs(i):
+            return g["L"] + g["bw"] * (i + 0.5)
+        lo, hi = -20, 120
+        for gv in (0, 20, 50, 80, 100):
+            col = GRID_C if gv in (0, 100) else GUIDE_C
+            cv.create_line(g["L"], ymap(gv), g["w"] - g["R"], ymap(gv),
+                           fill=col, dash=(2, 3) if gv in (20, 80) else ())
+            cv.create_text(g["L"] - 4, ymap(gv), text=str(gv),
+                           font=("Consolas", 7), fill=AXIS_TXT, anchor="e")
+        self._line(cv, xs, pct, ymap, "#e8a838", width=1)
+        lastv = next((x for x in reversed(pct) if x is not None), None)
+        info = f"%B={lastv:.0f}" if lastv is not None else ""
+        cv.create_text(g["L"] + 2, g["T"] - 3,
+                       text=f"BOLL %B  橙线(0下轨/100上轨)    {info}",
+                       anchor="w", font=("Microsoft YaHei", 8),
+                       fill=TITLE_TXT)
+        step = max(1, n // 10)
+        for i in range(0, n, step):
+            cv.create_text(xs(i), g["h"] - 7, text=v["dates"][i][5:],
+                           font=("Consolas", 7), fill=AXIS_TXT)
+        self._finish_panel(cv, g, "ind", -20, 120, v["dates"],
+                           fmt=lambda x: f"{x:.0f}")
 
     def _draw_macd(self):
         cv, v = self.cv_ind, self.view
@@ -3891,6 +4012,11 @@ class App:
             elif name == "KDJ":
                 ind_txt = (f"  K:{v['k'][idx]:.1f} D:{v['d'][idx]:.1f} "
                            f"J:{v['j'][idx]:.1f}")
+            elif name == "BOLL":
+                if None not in (v["boll_up"][idx], v["boll_low"][idx]):
+                    ind_txt = (f"  上轨:{v['boll_up'][idx]:.2f} "
+                               f"中轨:{v['boll_mid'][idx]:.2f} "
+                               f"下轨:{v['boll_low'][idx]:.2f}")
             else:
                 r6 = v["rsi6"][idx]
                 r12 = v["rsi12"][idx]
@@ -4040,6 +4166,21 @@ class App:
                 lv_txt.append(f"压力 {cp_['res']:.2f}")
             if lv_txt:
                 p("  " + " | ".join(lv_txt))
+        # 布林带参考
+        bl_up = next((x for x in reversed(res["ind"]["boll_up"])
+                      if x is not None), None)
+        bl_mid = next((x for x in reversed(res["ind"]["boll_mid"])
+                       if x is not None), None)
+        bl_low = next((x for x in reversed(res["ind"]["boll_low"])
+                       if x is not None), None)
+        if None not in (bl_up, bl_mid, bl_low):
+            p()
+            p("■ 布林带(20,2)")
+            p(f"  上轨 {bl_up:.2f} | 中轨 {bl_mid:.2f} | 下轨 {bl_low:.2f}")
+            pos = ("上轨上方·超买" if q["price"] > bl_up
+                   else "下轨下方·超卖" if q["price"] < bl_low
+                   else "带内")
+            p(f"  现价 {q['price']:.2f} 位于{pos}")
         act = res.get("action")
         if act:
             p()
@@ -4433,7 +4574,10 @@ class App:
             f"DIF={f3(last(ind['dif']))} DEA={f3(last(ind['dea']))} "
             f"MACD柱={f3(last(ind['mhist']))}\n"
             f"K={f1(last(ind['k']))} D={f1(last(ind['d']))} J={f1(last(ind['j']))}\n"
-            f"RSI6={f1(last(ind['rsi6']))} RSI12={f1(last(ind['rsi12']))}\n\n"
+            f"RSI6={f1(last(ind['rsi6']))} RSI12={f1(last(ind['rsi12']))}\n"
+            f"布林带(20,2): 上轨={f3(last(ind['boll_up']))} "
+            f"中轨={f3(last(ind['boll_mid']))} 下轨={f3(last(ind['boll_low']))}"
+            f" 现价位于{'上轨上方' if c > (last(ind['boll_up']) or 1e18) else ('下轨下方' if c < (last(ind['boll_low']) or -1) else '带内')}\n\n"
              f"历史形态统计预测(锚定{res.get('anchor', '今开')})：\n"
             f"今日收盘 P50={tp['cl'][50]:.2f}(P10 {tp['cl'][10]:.2f}/"
             f"P90 {tp['cl'][90]:.2f}) 上行概率{tp['up_prob']*100:.0f}%\n"

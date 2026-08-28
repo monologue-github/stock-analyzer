@@ -1557,6 +1557,21 @@ def calc_chips(rows, cur_price=None, nbin=120):
             "cur": cur_price}
 
 
+def calc_boll(closes, n=20, k=2.0):
+    """布林带：中轨=n日SMA，上下轨=中轨±k倍标准差。
+    返回 (mid, up, low) 三条序列，预热期为 None。"""
+    mid = sma_period(closes, n)
+    up = [None] * len(closes)
+    low = [None] * len(closes)
+    for i in range(n - 1, len(closes)):
+        seg = closes[i - n + 1:i + 1]
+        m = mid[i]
+        sd = (sum((x - m) ** 2 for x in seg) / n) ** 0.5
+        up[i] = m + k * sd
+        low[i] = m - k * sd
+    return mid, up, low
+
+
 def _band_fit_score(rows, mas, vr_arr):
     """波段适合度评分（0-100）：用实时技术特征判断该股是否适合做短线波段。
 
@@ -2390,6 +2405,7 @@ def analyze(full, progress=None, quick=False):
     dif, dea, mhist = calc_macd(closes_i)
     k_, d_, j_ = calc_kdj(disp_rows)
     r6, r12 = calc_rsi(closes_i, 6), calc_rsi(closes_i, 12)
+    b_mid, b_up, b_low = calc_boll(closes_i)
     mas = {n: sma_period(closes_i, n) for n in MA_COLORS}
 
     signals = []
@@ -2473,6 +2489,23 @@ def analyze(full, progress=None, quick=False):
             elif res_i and c >= res_i * 0.99:
                 sc -= 1
                 reasons.append("贴近压力")
+        # 布林带：均值回归参考（下轨超卖偏多 / 上轨超买偏空）
+        bu_i, bl_i = b_up[i], b_low[i]
+        if None not in (bu_i, bl_i):
+            if c < bl_i:
+                sc += 1
+                reasons.append("布林下轨超卖")
+            elif c > bu_i:
+                sc -= 1
+                reasons.append("布林上轨超买")
+            elif (disp_rows[i - 1]["close"] <= (b_low[i - 1] or 0)
+                    and c > bl_i):
+                sc += 1
+                reasons.append("布林下轨回升")
+            elif (disp_rows[i - 1]["close"] >= (b_up[i - 1] or 1e18)
+                    and c < bu_i):
+                sc -= 1
+                reasons.append("布林上轨回落")
         # 统计样本维度不放历史打分：今日匹配样本不能用于标注过去（防前视）
         # 最新一天的样本倾向已由综合评估中的"统计预测"维度体现
         _bull_scores.append((i, disp_rows[i]["date"], sc, reasons))
@@ -2480,8 +2513,10 @@ def analyze(full, progress=None, quick=False):
     # 方向切换触发：多头得分≥2且前一次信号为空头→BUY；空头得分≤-2且前一次为多头→SELL
     prev_dir = 0   # 0=无信号, 1=多头, -1=空头
     cooldown = 0
-    _bear_words = {"DIF<DEA", "放量下跌", "贴近压力"}
-    _bull_words = {"DIF>DEA", "放量上涨", "贴近支撑"}
+    _bear_words = {"DIF<DEA", "放量下跌", "贴近压力",
+                   "布林上轨超买", "布林上轨回落"}
+    _bull_words = {"DIF>DEA", "放量上涨", "贴近支撑",
+                   "布林下轨超卖", "布林下轨回升"}
 
     def _weak_day(day):
         """该交易日的市场是否弱势——只用当日(及以前)的大盘/板块数据，
@@ -2597,6 +2632,26 @@ def analyze(full, progress=None, quick=False):
                 items.append(("筹码", -1, f"贴近压力{res_i:.2f}"))
             elif chips["p5"] <= c <= chips["p95"]:
                 items.append(("筹码", 0, "处于筹码密集区中部"))
+        # 布林带：位置 + 中轨方向
+        bu_i, bl_i, bm_i = b_up[i], b_low[i], b_mid[i]
+        if None not in (bu_i, bl_i, bm_i):
+            bm_p = b_mid[i - 1] if i else None
+            mid_up = (bm_p is not None and bm_i > bm_p)
+            if c > bu_i:
+                items.append(("布林带", -1,
+                              f"高于上轨{bu_i:.2f} 超买注意回落"))
+            elif c < bl_i:
+                items.append(("布林带", 1,
+                              f"低于下轨{bl_i:.2f} 超卖关注反弹"))
+            elif c > bm_i and mid_up:
+                items.append(("布林带", 1,
+                              f"中轨{bm_i:.2f}上方且中轨向上"))
+            elif c < bm_i and not mid_up:
+                items.append(("布林带", -1,
+                              f"中轨{bm_i:.2f}下方且中轨向下"))
+            else:
+                items.append(("布林带", 0,
+                              f"中轨{bm_i:.2f}附近 方向不明"))
         up_p = t_pred["up_prob"]
         if up_p >= 0.55:
             items.append(("统计预测", 1, f"上行概率{up_p*100:.0f}%"))
@@ -2665,7 +2720,8 @@ def analyze(full, progress=None, quick=False):
         "cur_regime": cur_regime,
         "sector_name": sec_name, "sector_chg_today": sec_chg_today,
         "ind": {"ma": mas, "dif": dif, "dea": dea, "mhist": mhist,
-                "k": k_, "d": d_, "j": j_, "rsi6": r6, "rsi12": r12},
+                "k": k_, "d": d_, "j": j_, "rsi6": r6, "rsi12": r12,
+                "boll_mid": b_mid, "boll_up": b_up, "boll_low": b_low},
         "vols": vols,
         "chips": chips,
         "action": action,
