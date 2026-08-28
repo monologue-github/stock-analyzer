@@ -2816,15 +2816,6 @@ class App:
         top.pack(fill="x")
         ttk.Label(top, text="代码:").pack(side="left")
         self.code_var = tk.StringVar()
-        ent = ttk.Entry(top, textvariable=self.code_var, width=14)
-        ent.pack(side="left", padx=3)
-        ent.bind("<Return>", lambda e: self.run())
-        self.btn_run = ttk.Button(top, text="分析预测", command=self.run)
-        self.btn_run.pack(side="left", padx=3)
-
-        top.pack(fill="x")
-        ttk.Label(top, text="代码:").pack(side="left")
-        self.code_var = tk.StringVar()
         ent = ttk.Entry(top, textvariable=self.code_var,
                         width=9 if self.compact else 14)
         ent.pack(side="left", padx=3)
