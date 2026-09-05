@@ -34,12 +34,15 @@ K线源自动切换：腾讯 -> 东财 -> 网易163 -> 新浪；支持代理（s
 '''
 
 CLI_IMPORTS = '''
+import atexit
+import configparser
 import heapq
 import json
 import logging
 import math
 import os
 import random
+import re
 import sqlite3
 import subprocess
 import sys
@@ -50,6 +53,11 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
+
+try:
+    import numpy as np            # 数值加速（缺失时自动退回纯Python）
+except ImportError:
+    np = None
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 

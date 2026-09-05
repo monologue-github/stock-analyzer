@@ -11,6 +11,7 @@
 
 仅统计参考，不构成投资建议。
 """
+import atexit
 import configparser
 import heapq
 import json
@@ -18,6 +19,7 @@ import logging
 import math
 import os
 import random
+import re
 import sqlite3
 import threading
 import time
@@ -26,6 +28,11 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
+
+try:
+    import numpy as np            # 数值加速（缺失时自动退回纯Python）
+except ImportError:
+    np = None
 
 CACHE_OK = True
 
@@ -67,7 +74,18 @@ def setup_logging():
 
 setup_logging()
 
-KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+KLINE_URL = "https://ifzq.gtimg.cn/appstock/app/fqkline/get"
+# 急救箱(stock_firstaid.py)写入的备用源覆盖默认值：
+# ini [data] kline_url = 完整接口URL（须以http(s)开头，否则忽略）
+try:
+    import configparser as _cp_firstaid
+    _fa_cp = _cp_firstaid.ConfigParser()
+    _fa_cp.read(INI_PATH, encoding="utf-8")
+    _fa_url = _fa_cp.get("data", "kline_url", fallback="").strip()
+    if _fa_url.startswith(("http://", "https://")):
+        KLINE_URL = _fa_url
+except Exception:
+    pass
 UT = "fa5fd1943c7b386f172d6893dbfba10b"
 TIERS = ("大盘", "中盘", "小盘")
 STOCKS_TTL = 7 * 86400          # 全市场代码表缓存7天
@@ -88,8 +106,10 @@ _BG_EX = ThreadPoolExecutor(max_workers=2, thread_name_prefix="bg")
 
 class CFG:
     """集中调参（原散落各处的魔数收敛于此；模块级别名保持兼容）。"""
-    W_WINDOW = 10                       # 形态匹配窗口长度
-    TOPK = 10                           # Top-K 相似样本数
+    W_WINDOW = 20                       # 形态匹配窗口长度（扫描：W20 IC+0.016
+                                        # vs W10≈0，两次独立一致，自适应兼容短历史）
+    TOPK = 10                           # Top-K 相似样本数（显示用）
+    CANDIDATE_TOPK = 50                 # 候选样本数（扩大后再筛选）
     LV_W = {"L1": 0.6, "L2": 0.3, "L3": 0.1}    # 三级样本池权重
     SIGNAL_SCORE_BUY = 2                # 多头信号触发分
     SIGNAL_SCORE_SELL = -2              # 空头信号触发分
@@ -98,6 +118,60 @@ class CFG:
     WEAK_SEC_TH = -2.0                  # 板块弱势阈值(%)
     BAND_FIT_MIN = 60.0                 # 波段适合度门槛
     PRED_MAX_DAYS = 10                  # 多日预测天数
+    
+    # 样本质量筛选与加权参数
+    SIMILARITY_WEIGHTING = False        # 指数相似度加权（消融回测证实拖后腿：
+                                        # 关闭后 命中50.4%→52.4%, IC -0.043→+0.020）
+    QUALITY_FILTER = True               # 是否启用样本质量筛选
+    MAX_DAILY_CHANGE = 10.0             # 单日涨跌停阈值(%) - 超过视为异常
+    MIN_SAMPLES_REQUIRED = 3            # 最少样本数要求 - 少于则降低置信度
+    SIMILARITY_CUTOFF = 2.5             # 相似度截断阈值 - 超过则降低权重
+    TIME_DECAY_ENABLED = True           # 是否启用时间衰减
+    TIME_DECAY_DAYS = 90                # 时间衰减天数 - 超过此天数的样本权重衰减
+    TIME_DECAY_RATE = 0.3               # 时间衰减率 - 超过天数的样本权重乘数
+    
+    # 置信度系统参数
+    CONFIDENCE_ENABLED = True           # 是否启用置信度系统
+    LOW_CONFIDENCE_SCORE = 0.3          # 低置信度阈值
+    MEDIUM_CONFIDENCE_SCORE = 0.6       # 中置信度阈值
+
+    # 多维形态匹配扩展（K线结构/波动率/RSI/量变/周线环境）
+    STRUCT_W = 0.50                     # K线结构距离权重
+    VOLA_W = 0.80                       # 波动率距离权重
+    RSI_W = 0.50                        # RSI距离权重
+    VOLCHG_W = 0.40                     # 量变(近5日/前5日)距离权重
+    WEEKLY_W = 0.60                     # 周线环境距离权重
+    WEEKLY_N = 4                        # 周线环境回看周数
+
+    # 动态三级权重
+    DYNAMIC_LV_W = True                 # 是否按各层最优相似度动态调整 L1/L2/L3 权重
+    DYN_LV_STRENGTH = 0.5               # 动态混合强度(0=固定先验,1=完全按样本质量)
+    # 层级消融回测(n=225)：L1+L2 命中56.9%/IC+0.057 最优；
+    # L3(同市值层)拖后腿(并入后IC降至-0.001)，默认关闭
+    ENABLE_L3 = False
+    # 区间校准系数（n=4500实测：样本分位区间系统性过窄41%/70%，
+    # 偏离P50放大1.3倍后 P25-P75→51.8%(名义50)、P10-P90→80.0%(名义80)）
+    INTERVAL_K = 1.3
+    # T+5 区间校准系数（n=4500标定 1.4最优：51.6%/79.2%）
+    INTERVAL_K5 = 1.4
+
+    # ---- 风险偏好（三级·网格寻优后参数）----
+    # 保守=信号严(评分3+冷却8)+止损紧(ATR1.5/回落4%即走) → 胜率40.9%·年化中位-0.9%（最优）
+    # 激进=捕捉机会(评分1+冷却3)+止损松(ATR2.5/回落10%) → 胜率31.7%·-6.0%，波动大机会多
+    # 数据源：n=6000回测网格，详见 报告_买卖点收益回测.md
+    RISK_MODE = "稳健"
+    RISK_PARAMS = {
+        "保守": {"atr_mult": 1.5, "trail_trigger": 1.01,
+                 "trail_ratio": 0.96, "buy_th": 3, "cooldown": 8},
+        "稳健": {"atr_mult": 1.5, "trail_trigger": 1.02,
+                 "trail_ratio": 0.94, "buy_th": 2, "cooldown": 5},
+        "激进": {"atr_mult": 2.5, "trail_trigger": 1.05,
+                 "trail_ratio": 0.90, "buy_th": 1, "cooldown": 3},
+    }
+
+    def risk_params():
+        return CFG.RISK_PARAMS.get(CFG.RISK_MODE, CFG.RISK_PARAMS["稳健"])
+    
     # 各技术维度在信号打分中的权重（1.0=标准；<1 降权、>1 升权）
     IND_W = {
         "MACD": 1.1,        # 趋势主指标，加权
@@ -109,6 +183,56 @@ class CFG:
         "布林带": 0.8,      # 均值回归维度，震荡市才准，降权
         "ADX": 0.8,         # 趋势强度过滤器维度
     }
+
+
+def _load_predict_cfg():
+    """从 stock_gui.ini [predict] 读取用户调过的预测参数（带范围钳制）。
+    必须在模块级别名 W_WINDOW/TOPK 赋值之前执行。"""
+    try:
+        cp = configparser.ConfigParser()
+        cp.read(INI_PATH, encoding="utf-8")
+        if not cp.has_section("predict"):
+            cp.add_section("predict")   # 缺节时 get 才不会抛 NoSectionError
+
+        def gi(key, dflt, lo, hi):
+            try:
+                return max(lo, min(hi, int(cp.get("predict", key,
+                                                  fallback=dflt))))
+            except (ValueError, TypeError):
+                return dflt
+
+        def gf(key, dflt, lo, hi):
+            try:
+                return max(lo, min(hi, float(cp.get("predict", key,
+                                                    fallback=dflt))))
+            except (ValueError, TypeError):
+                return dflt
+
+        CFG.W_WINDOW = gi("w_window", CFG.W_WINDOW, 5, 30)
+        CFG.TOPK = gi("topk", CFG.TOPK, 3, 30)
+        CFG.CANDIDATE_TOPK = gi("candidate_topk", CFG.CANDIDATE_TOPK, 10, 100)
+        CFG.TIME_DECAY_DAYS = gi("time_decay_days", CFG.TIME_DECAY_DAYS,
+                                 0, 1095)
+        CFG.TIME_DECAY_RATE = gf("time_decay_rate", CFG.TIME_DECAY_RATE,
+                                 0.0, 1.0)
+        CFG.DYN_LV_STRENGTH = gf("dyn_lv_strength", CFG.DYN_LV_STRENGTH,
+                                 0.0, 1.0)
+        CFG.WEEKLY_N = gi("weekly_n", CFG.WEEKLY_N, 2, 8)
+        CFG.STRUCT_W = gf("struct_w", CFG.STRUCT_W, 0.0, 3.0)
+        CFG.VOLA_W = gf("vola_w", CFG.VOLA_W, 0.0, 3.0)
+        CFG.RSI_W = gf("rsi_w", CFG.RSI_W, 0.0, 3.0)
+        CFG.VOLCHG_W = gf("volchg_w", CFG.VOLCHG_W, 0.0, 3.0)
+        CFG.WEEKLY_W = gf("weekly_w", CFG.WEEKLY_W, 0.0, 3.0)
+        rm = cp.get("predict", "risk_mode", fallback=CFG.RISK_MODE)
+        if rm in CFG.RISK_PARAMS:
+            CFG.RISK_MODE = rm
+        CFG.ENABLE_L3 = bool(gi("enable_l3", 0 if not CFG.ENABLE_L3 else 1,
+                                0, 1))
+    except Exception:
+        log.exception("读取预测参数失败(使用默认)")
+
+
+_load_predict_cfg()
 
 
 W_WINDOW: int = CFG.W_WINDOW
@@ -424,18 +548,15 @@ def _db_rows_batch(conn, codes):
 
 
 def _bar_ok(r):
-    """K线数据合法性校验：剔除脏数据（负价/高低颠倒/影线超实体1.5倍）。"""
+    """K线数据结构合法性校验：剔除脏数据（缺失/非正价/高低颠倒）。
+    影线比例不再作为剔除依据——低价股分值效应下正常K线会被大量误杀
+    （实测老数据误杀率30%+），价格异常由 _bars_anomalous 涨跌幅校验兜底。"""
     o, h, l, c = r["open"], r["high"], r["low"], r["close"]
     if None in (o, h, l, c):
         return False
     if min(o, h, l, c) <= 0:
         return False
     if h < l:
-        return False
-    body = abs(c - o)
-    if body < 1e-9:
-        return True          # 十字星允许
-    if (h - max(o, c)) > body * 1.5 or (min(o, c) - l) > body * 1.5:
         return False
     return True
 
@@ -670,8 +791,11 @@ def _fetch_sina(full, count=600):
 
 
 def _fetch_remote_rows(full, count=600):
-    """多源自动切换 + 熔断调度：腾讯 → 东财 → 网易163 → 新浪。
+    """多源自动切换 + 熔断调度：腾讯ifzq → 东财 → 新浪 → 网易163。
 
+    2026-08 实测：web.ifzq.gtimg.cn 已下线(501)，proxy.finance.qq.com
+    返回404，现役主域为 ifzq.gtimg.cn；东财 push2his 整域故障期间
+    自动降级；网易163服务端502时段排到最后。
     运行逻辑：
     1. 按优先级遍历数据源，跳过处于熔断冷却期的源；
     2. 若所有源都在冷却（极端503风暴），退化为「半开探测」：
@@ -686,10 +810,10 @@ def _fetch_remote_rows(full, count=600):
             "fqkline/get")),
         ("腾讯HTTP", lambda: _fetch_tencent(
             full, count,
-            "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get")),
+            "http://ifzq.gtimg.cn/appstock/app/fqkline/get")),
         ("东财", lambda: _fetch_eastmoney(full, count)),
-        ("网易163", lambda: _fetch_163(full, count)),
         ("新浪", lambda: _fetch_sina(full, count)),
+        ("网易163", lambda: _fetch_163(full, count)),
     ]
     last_err = None
     usable = [(n, f) for n, f in sources if _cb_ok(n)]
@@ -702,13 +826,16 @@ def _fetch_remote_rows(full, count=600):
         try:
             rows = fetcher()
             _cb_record(name, True)
-            if rows and len(rows) >= 20:
+            # 新股可能只有几根K线：>=5 即视为有效（分析层另有30根门槛）
+            if rows and len(rows) >= 5:
                 return rows
             last_err = RuntimeError(f"{name}返回空K线")
         except Exception as e:
             _cb_record(name, False, e)
             last_err = e
             continue
+    _auto_heal_kline()          # 全灭时自动探测候选域并切换
+    _maybe_ai_rescue()          # 仍无解：弹窗询问是否让AI找源(GUI)
     raise RuntimeError(f"所有数据源均失败: {last_err}")
 
 
@@ -716,6 +843,118 @@ FAIL_TTL = 3600                 # 拉取失败记忆期1小时
 _MIN_INTERVAL = 0.16            # 全局HTTP最小间隔，防腾讯限速
 _THROTTLE_LOCK = threading.Lock()
 _LAST_REQ = [0.0]
+
+
+# ---- K线源自动容灾（急救箱逻辑内嵌，无人工参与）----
+_KLINE_HEAL_TS = [0.0]          # 上次自愈探测时间（10分钟限频）
+_KLINE_HEAL_LOCK = threading.Lock()
+_KLINE_DEFAULTS = (
+    "https://ifzq.gtimg.cn/appstock/app/fqkline/get",
+    "http://ifzq.gtimg.cn/appstock/app/fqkline/get",
+    "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
+    "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+)
+
+
+def _probe_kline_url(base):
+    """实测一个K线接口是否真的有数据（近5根日K + JSON合法）。"""
+    try:
+        txt = _http_get(base + "?param=sz002241,day,,,5,qfq",
+                        retries=1, timeout=6)
+        d0 = (json.loads(txt).get("data") or {}).get("sz002241") or {}
+        bars = d0.get("qfqday") or d0.get("day") or []
+        return len(bars) >= 5
+    except Exception:
+        return False
+
+
+def _persist_kline_url(u):
+    """把可用K线源写入内存与 ini（重启后仍生效）。"""
+    globals()["KLINE_URL"] = u
+    try:
+        cp = configparser.ConfigParser()
+        cp.read(INI_PATH, encoding="utf-8")
+        if not cp.has_section("data"):
+            cp.add_section("data")
+        cp.set("data", "kline_url", u)
+        cp.set("data", "kline_url_updated", time.strftime("%Y-%m-%d %H:%M"))
+        with open(INI_PATH, "w", encoding="utf-8") as f:
+            cp.write(f)
+    except Exception:
+        log.exception("kline_url 持久化失败(忽略)")
+
+
+def _auto_heal_kline():
+    """全部K线源失败时自动探测候选域并切换（内存+ini持久化）。
+    10分钟限频，探测失败不影响原流程。"""
+    with _KLINE_HEAL_LOCK:
+        if time.time() - _KLINE_HEAL_TS[0] < 600:
+            return False
+        _KLINE_HEAL_TS[0] = time.time()
+    cands = [u for u in _KLINE_DEFAULTS if u != KLINE_URL]
+    for u in cands:
+        if _probe_kline_url(u):
+            _persist_kline_url(u)
+            log.warning("K线源自动切换: %s", u)
+            return True
+    return False
+
+
+# ---- AI 找源（需用户弹窗确认；AI只提议URL，程序实测验证后才启用）----
+_AI_RESCUE_HOOK = None          # App.__init__ 注册的GUI确认回调
+_AI_RESCUE_TS = [0.0]           # 30分钟内不重复触发
+_AI_RESCUE_LOCK = threading.Lock()
+_AI_URL_RE = re.compile(r"https?://[^\s\"'<>)\\]]+", re.I)
+
+
+def ai_rescue_kline(api_key, model=None):
+    """让 DeepSeek 提议候选K线接口URL，逐个实测验证，采用第一个通过者。
+    返回 (ok, 提示消息)。绝不执行模型输出的代码，只做 GET 探测。"""
+    import re as _re
+    if not api_key:
+        return False, "未配置DeepSeek Key，无法AI找源"
+    prompt = (
+        "我有一个A股工具，所有已知K线数据接口都失效了。"
+        f"请给我最多5个【可以直接HTTP GET】获取A股 sz002241 日K线数据的"
+        "候选接口完整URL（免费、无需key，返回JSON或CSV均可），"
+        "一行一个URL，不要解释，不要markdown代码块，只输出URL列表。")
+    try:
+        txt = deepseek_chat(api_key, prompt, model=model, timeout=60)
+    except Exception as e:
+        return False, f"AI调用失败: {e}"
+    urls = []
+    for u in _AI_URL_RE.findall(txt or ""):
+        u = u.rstrip(".,;，。；")
+        if u not in urls:
+            urls.append(u)
+    urls = urls[:5]
+    if not urls:
+        return False, "AI未给出可用URL"
+    log.info("AI找源: 验证 %d 个候选", len(urls))
+    for u in urls:
+        if _probe_kline_url(u):
+            _persist_kline_url(u)
+            log.warning("K线源已采用AI提议: %s", u)
+            return True, f"已采用AI提议源: {u}"
+    return False, f"AI提议{len(urls)}个均未通过验证(已丢弃)"
+
+
+def _maybe_ai_rescue():
+    """全灭后触发AI找源确认弹窗（经App注册的钩子转到主线程）。
+    30分钟限频；无钩子（CLI）或无Key时只在日志提示。"""
+    global _AI_RESCUE_HOOK
+    with _AI_RESCUE_LOCK:
+        if time.time() - _AI_RESCUE_TS[0] < 1800:
+            return False
+        _AI_RESCUE_TS[0] = time.time()
+    if _AI_RESCUE_HOOK is None:
+        log.info("所有K线源失效；可运行 python stock_firstaid.py --ai 手动找源")
+        return False
+    try:
+        _AI_RESCUE_HOOK()
+    except Exception:
+        log.exception("AI找源弹窗触发失败")
+    return True
 
 
 def get_daily(full: str, min_bars: int = 100, tail=None):
@@ -739,10 +978,25 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
     # 2) 有数据但过期或涨幅异常 → 拉远端（异常时清空全量替换）
     if rows:
         try:
-            remote = [r for r in _fetch_remote_rows(full)
+            remote = [r for r in _fetch_remote_rows(full, count=1100)
                       if r["date"] < today and _bar_ok(r)]
+            # 基期一致性校验：前复权序列每次分红整体重定基，增量合并会在
+            # 缓存接缝处留下人造跳空。重叠日期收盘价偏差>0.5% → 全量替换。
+            rebase = False
+            if rows and remote:
+                newmap = {r["date"]: r["close"] for r in remote}
+                checked = 0
+                for r in rows[-200:]:
+                    c2 = newmap.get(r["date"])
+                    if c2 and r["close"]:
+                        checked += 1
+                        if abs(c2 / r["close"] - 1) > 0.005:
+                            rebase = True
+                            break
+                rebase = rebase and checked >= 5
             with db_conn(commit=True) as conn2:
-                if bad_cache:
+                # 只有新数据足够长才允许全量替换，防止短源摧毁深历史
+                if (bad_cache or rebase) and len(remote) >= min(400, len(rows) // 2):
                     conn2.execute("DELETE FROM daily_bars WHERE code=?",
                                   (full,))
                 if remote:
@@ -752,6 +1006,8 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
                         "VALUES(?,?,?,?,?,?,?)",
                         [(full, r["date"], r["open"], r["high"], r["low"],
                           r["close"], r["vol"]) for r in remote])
+            if rebase:
+                log.info("%s 前复权基期漂移，已全量重定基", full)
             # 重新读取合并后的数据
             with db_conn() as conn3:
                 rows = _db_rows(conn3, full)
@@ -769,8 +1025,23 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
 
     # 4) 从未获取过 → 网络请求
     try:
-        remote = _fetch_remote_rows(full)
+        remote = _fetch_remote_rows(full, count=1100)
     except Exception as e:
+        # 未上市/无数据识别：行情快照也拿不到有效价 → 静默记为未上市
+        listed = True
+        try:
+            qq = fetch_quote(full)
+            listed = bool(qq and qq.get("price") and qq["price"] > 0)
+        except Exception:
+            listed = False
+        if not listed:
+            log.info("%s 未上市或无行情数据，跳过", full)
+            with db_conn(commit=True) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO failed(code,ts,reason) "
+                    "VALUES(?,?,?)",
+                    (full, time.time(), "未上市或无数据"))
+            raise RuntimeError(f"{full} 未上市或无行情数据")
         log.warning("get_daily 首次拉取失败 %s: %s", full, e)
         # 失败退避：已有负缓存记录的代码（反复失败），时长翻倍，
         # 上限24h，避免样本池里拉不到的代码每天反复撞限流
@@ -828,6 +1099,8 @@ def prefetch(codes, workers=6, progress=None):
     total = len(codes)
     if total == 0:
         return
+    # 进度上报粒度：大批量约每5%报一次，小批量每只都报
+    step = max(1, min(10, total // 20 or 1))
 
     def one(c):
         try:
@@ -835,8 +1108,9 @@ def prefetch(codes, workers=6, progress=None):
         except Exception:
             log.debug("prefetch 跳过 %s", c, exc_info=True)
         done[0] += 1
-        if progress and done[0] % 10 == 0:
-            progress(f"缓存回填 {done[0]}/{total}")
+        if progress and (done[0] % step == 0 or done[0] == total):
+            progress(f"缓存回填 {done[0]}/{total} "
+                     f"({done[0] * 100 // total}%)")
 
     ex = _SHARED_EX                # 全局共享线程池，不再每次新建
     list(ex.map(one, codes))
@@ -1034,12 +1308,36 @@ def tier_sample(full: str, n: int = 0, exclude_industries=()):
     return out, tier
 
 
+# 题材行业（交易回测证实：这些行业L2无增益，只用L1）+ 传统行业ETF池
+THEME_KW = ("软件", "计算机", "半导体", "元件", "电子", "通信", "光电",
+            "IT", "互联网", "游戏", "传媒", "数字", "消费电子", "光学",
+            "医药", "中药", "生物", "医疗", "制药", "疫苗")
+ETF_POOL = ("sh510300", "sh510500", "sz159915", "sh588000", "sh510050",
+            "sh512100", "sh510880", "sz159922", "sh512880", "sh512690")
+
+
+def _is_theme_industry(industry):
+    """科技/医药等题材行业：L2跨股池无增益，只参考L1自身历史。"""
+    return any(k in (industry or "") for k in THEME_KW)
+
+
 def pool_codes(full, l2_n=L2_DEFAULT_N, l3_n=0):
-    """一次拿到两级样本池。l3_n<=0 表示 L3 不限量（缓存优先排序）。"""
+    """一次拿到两级样本池。l3_n<=0 表示 L3 不限量（缓存优先排序）。
+
+    - 题材行业/ETF 目标：返回空池（只用 L1）
+    - 传统行业：L2 = 精确同行业 + 宽基/行业ETF池（交易回测胜率+2.2pp）"""
+    if _is_etf(full):
+        return {"l2": [], "l3": [], "industry": None, "tier": None}
     peers, industry = industry_peers(full, l2_n)
+    if _is_theme_industry(industry):
+        return {"l2": [], "l3": [], "industry": industry, "tier": None}
     l3, tier = tier_sample(full, l3_n, exclude_industries=(industry,))
     seen = {full}
     l3 = [c for c in l3 if c not in seen and not seen.add(c)]
+    # 传统行业：L2 并入 ETF 池（市场beta形态样本）
+    if peers:
+        eseen = set(peers) | {full}
+        peers = peers + [e for e in ETF_POOL if e not in eseen]
     return {"l2": peers, "l3": l3,
             "industry": industry, "tier": tier}
 
@@ -1119,30 +1417,39 @@ def http_get(url: str, retries: int = 3) -> str:
 
 def normalize_code(code):
     code = code.strip().lower()
-    # 触摸屏/输入法常见：全角字符折叠为半角，删除所有空白
+    # 触摸屏/输入法常见：全角字符折叠为半角
     code = "".join(
         chr(ord(ch) - 0xFEE0) if 0xFF01 <= ord(ch) <= 0xFF5E else ch
         for ch in code)
-    code = "".join(code.split())
-    # 兼容 002241.sz / 600519.SH 等后缀形式
-    if "." in code:
-        parts = code.split(".")
-        if len(parts) == 2 and len(parts[0]) == 6 and len(parts[1]) == 2:
-            code = parts[1] + parts[0]
+    # 只保留ASCII字母数字：零宽/NBSP/控制字符/中文标点一次性清除
+    code = "".join(ch for ch in code if ch.isascii() and ch.isalnum())
+    # 兼容 002241sz / sz.002241 / sh-600519 / 600519.SH 等变体
+    if len(code) == 8 and code[-2:] in ("sh", "sz", "bj"):
+        code = code[-2:] + code[:6]    # 002241sz → sz002241
+    # 触摸屏 O/I/L 与 0/1 误触：'O00725'→'000725'（仅当整体为纯数字时替换）
+    if any(ch in code for ch in "oil"):
+        code2 = (code.replace("o", "0").replace("i", "1")
+                     .replace("l", "1"))
+        if code2.isdigit() or code2[:2] in ("sh", "sz", "bj"):
+            code = code2
     for p in ("sh", "sz", "bj"):
         if code.startswith(p):
             return p + code[2:]
     d = "".join(ch for ch in code if ch.isdigit())
     if len(d) != 6:
         # !r 显示原始输入（含隐藏字符），便于远程排查
-        raise ValueError(f"代码格式不对: {code!r}")
+        raise ValueError(
+            f"代码格式不对: {code!r}\n"
+            "支持：002241 / 600519 / sh600519 / sz002241 / 002241.sz")
     if d[0] in "69" or d[:2] in ("51", "56", "58"):      # 沪股/沪ETF
         return "sh" + d
     if d[0] in "03" or d[:2] in ("15", "16", "18"):      # 深股/深ETF/LOF
         return "sz" + d
     if d[0] in "48":
         return "bj" + d
-    raise ValueError(f"不支持的代码: {code!r}")
+    raise ValueError(
+        f"不支持的代码: {code!r}\n"
+        "支持：沪深A股/ETF（0/3/6/5开头）与北交所（4/8开头）")
 
 
 def vol_ratio_at(vols, i):
@@ -1182,60 +1489,73 @@ _IDX_QUOTE_TTL = 60         # 60 秒
 
 _TOP_SECTORS_CACHE = None
 _TOP_SECTORS_TS = 0.0
+_TOP_SECTORS_LAST = ([], [])    # 最近一次成功结果（网络全挂时回退用）
+_TOP_SECTORS_WARN_TS = 0.0      # 失败警告降噪：10分钟内只警告一次
 
 
 def fetch_top_sectors():
     """获取今日行业板块涨跌幅排行（Top3涨/Top3跌）。
     返回 [(name, pct), ...] 的两个列表，带10分钟缓存。
-    缓存读写持有 _STATE_LOCK；请求统一走熔断 _http_get。"""
-    global _TOP_SECTORS_CACHE, _TOP_SECTORS_TS
+    缓存读写持有 _STATE_LOCK；请求统一走熔断 _http_get。
+    网络全挂时回退最近一次成功结果（可能滞后，但好于空白）。"""
+    global _TOP_SECTORS_CACHE, _TOP_SECTORS_TS, _TOP_SECTORS_WARN_TS
     now = time.time()
     with _STATE_LOCK:
         if _TOP_SECTORS_CACHE and now - _TOP_SECTORS_TS < 600:
             return _TOP_SECTORS_CACHE
     UT = "fa5fd1943c7b386f172d6893dbfba10b"
     hdr = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
-    hosts = ("https://push2.eastmoney.com", "https://push2delay.eastmoney.com")
-    try:
-        items = []
-        vals = []
-        for pn in (1, 2, 3):
-            u = (f"/api/qt/clist/get"
-                 f"?pn={pn}&pz=100&po=1&np=1&fltt=2&invariant=0"
-                 f"&fields=f12,f14,f3&fs=m:90+t:2&ut={UT}")
-            done = False
-            for host in hosts:
-                try:
-                    data = json.loads(_http_get(
-                        host + u, retries=2, timeout=6, headers=dict(hdr),
-                        src_name="东财板块"))
-                    diff = data.get("data", {}).get("diff") or {}
-                    vals = list(diff.values()) if isinstance(diff, dict) else diff
-                    for it in vals:
-                        name = it.get("f14", "")
-                        pct = it.get("f3")
-                        if name and pct is not None:
-                            items.append((name, float(pct)))
-                    done = True
-                    break
-                except Exception as e:
+    # HTTPS/HTTP × 主域/延迟域：连接被重置时逐个轮换
+    hosts = ("https://push2delay.eastmoney.com",
+             "https://push2.eastmoney.com",
+             "http://push2delay.eastmoney.com",
+             "http://push2.eastmoney.com")
+    items = []
+    vals = []
+    fail_cnt = 0
+    for pn in (1, 2, 3):
+        u = (f"/api/qt/clist/get"
+             f"?pn={pn}&pz=100&po=1&np=1&fltt=2&invariant=0"
+             f"&fields=f12,f14,f3&fs=m:90+t:2&ut={UT}")
+        done = False
+        for host in hosts:
+            try:
+                data = json.loads(_http_get(
+                    host + u, retries=3, timeout=8, headers=dict(hdr),
+                    src_name="东财板块"))
+                diff = data.get("data", {}).get("diff") or {}
+                vals = list(diff.values()) if isinstance(diff, dict) else diff
+                for it in vals:
+                    name = it.get("f14", "")
+                    pct = it.get("f3")
+                    if name and pct is not None:
+                        items.append((name, float(pct)))
+                done = True
+                break
+            except Exception as e:
+                fail_cnt += 1
+                if now - _TOP_SECTORS_WARN_TS > 600:
                     log.warning("板块排行第%d页 %s 失败: %s", pn, host, e)
-                    continue
-            if not done:
-                break
-            if len(vals) < 100:
-                break
+                else:
+                    log.debug("板块排行第%d页 %s 失败: %s", pn, host, e)
+                continue
+        if not done:
+            break
+        if len(vals) < 100:
+            break
+    if now - _TOP_SECTORS_WARN_TS > 600:
+        _TOP_SECTORS_WARN_TS = now
+    if items:
         items.sort(key=lambda x: x[1], reverse=True)
-        top3 = items[:3]
-        bot3 = items[-3:][::-1]
-        result = (top3, bot3)
+        result = (items[:3], items[-3:][::-1])
         with _STATE_LOCK:
             _TOP_SECTORS_CACHE = result
             _TOP_SECTORS_TS = now
+            _TOP_SECTORS_LAST = result
         return result
-    except Exception:
-        log.exception("fetch_top_sectors 失败")
-        return ([], [])
+    # 全部失败：回退最近一次成功结果，避免界面板块栏空白
+    log.info("板块排行本轮全部失败(%d次请求)，回退上次结果", fail_cnt)
+    return _TOP_SECTORS_LAST
 
 
 def fetch_sector_context(full):
@@ -1338,6 +1658,9 @@ def fetch_sector_context(full):
                 _SECTOR_CACHE[full] = (time.time(),
                                        (ind_name, {}, today_chg))
             return ind_name, {}, today_chg
+        if len(bars) < 2:
+            log.info("板块 %s(%s) 日K数据不足2天", ind_name, bk_code)
+            return ind_name, {}, None
         chg_by_date = {
             b[0]: (b[1] / a[1]) * 100 - 100
             for a, b in zip(bars, bars[1:])
@@ -1693,7 +2016,7 @@ def _trend_track_signals(disp_rows, mas, idx_chg_by_date, idx_chg_today):
     return signals
 
 
-def backtest_signals(rows, signals):
+def backtest_signals(rows, signals, rp=None):
     """按买卖点信号模拟交易（信号日收盘价成交，无手续费）。
     BUY开仓/SELL平仓，带ATR动态止损+移动止盈。
     返回 胜率、区间收益、年化收益、最大回撤。"""
@@ -1712,22 +2035,25 @@ def backtest_signals(rows, signals):
                            abs(rows[j]["low"] - rows[j-1]["close"])) 
                       for j in range(i-13, i+1)) / 14
         
+        rp = rp or CFG.risk_params()
         eq = 1.0
         entry = None
         highest = None  # 持仓期间最高价
         trades = []
         curve = []
-        
+
         for i, r in enumerate(rows):
             c = r["close"]
             h = r["high"]
             l = r["low"]
             typ = sig_map.get(i)
-            
+
             if entry is not None:
                 highest = max(highest, h) if highest else h
-                atr_stop = entry - 2.0 * atrs[i] if atrs[i] > 0 else entry * 0.95
-                trail_stop = highest * 0.92 if highest > entry * 1.03 else atr_stop
+                atr_stop = entry - rp["atr_mult"] * atrs[i] if atrs[i] > 0 \
+                    else entry * 0.95
+                trail_stop = highest * rp["trail_ratio"] \
+                    if highest > entry * rp["trail_trigger"] else atr_stop
                 
                 # 止损触发（日内最低触及止损价）
                 if l <= trail_stop:
@@ -1790,6 +2116,159 @@ def backtest_signals(rows, signals):
     except Exception:
         log.exception("backtest_signals 回测失败")
         return None
+
+
+def daily_pick_score(rows):
+    """对最新一根K线做多维打分（与买卖点信号同构，权重同 CFG.IND_W）。
+    返回 (score, reasons, band_fit_score)。"""
+    n = len(rows)
+    if n < 60:
+        return None
+    closes = [r["close"] for r in rows]
+    dif, dea, _ = calc_macd(closes)
+    k_, d_, _ = calc_kdj(rows)
+    r6 = calc_rsi(closes, 6)
+    b_mid, b_up, b_low = calc_boll(closes)
+    pdi_a, mdi_a, adx_a = calc_adx(rows)
+    mas = {20: sma_period(closes, 20), 60: sma_period(closes, 60)}
+    vols_d = [r.get("vol") or 0.0 for r in rows]
+    vr_arr = [vol_ratio_at(vols_d, k) for k in range(n)]
+    i = n - 1
+    if None in (dif[i], dea[i], dif[i - 1], dea[i - 1]):
+        return None
+    sc = 0
+    reasons = []
+
+    def _wadd(dim, pts, reason=None):
+        nonlocal sc
+        sc += int(round(pts * CFG.IND_W.get(dim, 1.0)))
+        if reason and pts:
+            reasons.append(reason)
+
+    if dif[i - 1] <= dea[i - 1] and dif[i] > dea[i]:
+        _wadd("MACD", 2, "MACD金叉")
+    elif dif[i] > dea[i]:
+        _wadd("MACD", 1, "DIF>DEA")
+    elif dif[i - 1] >= dea[i - 1] and dif[i] < dea[i]:
+        _wadd("MACD", -2, "MACD死叉")
+    else:
+        _wadd("MACD", -1)
+    if k_[i - 1] <= d_[i - 1] and k_[i] > d_[i] and k_[i] < 45:
+        _wadd("KDJ", 2, "KDJ低位金叉")
+    elif k_[i] > d_[i]:
+        _wadd("KDJ", 1)
+    elif k_[i - 1] >= d_[i - 1] and k_[i] < d_[i] and k_[i] > 65:
+        _wadd("KDJ", -2, "KDJ高位死叉")
+    else:
+        _wadd("KDJ", -1)
+    if r6[i] is not None and r6[i - 1] is not None:
+        if r6[i - 1] < 20 and r6[i] >= 20:
+            _wadd("RSI", 2, "RSI超卖回升")
+        elif r6[i] < 30:
+            _wadd("RSI", 1)
+        elif r6[i] > 70:
+            _wadd("RSI", -1)
+    c, cp = rows[i]["close"], rows[i - 1]["close"]
+    v5 = sum(vols_d[max(0, i - 5):i]) / max(1, min(5, i))
+    vr_d = vols_d[i] / v5 if v5 > 0 else 0.0
+    if vr_d > 1.5 and c > cp:
+        _wadd("量价", 1, "放量上涨")
+    elif vr_d > 1.5 and c < cp:
+        _wadd("量价", -1, "放量下跌")
+    ma20, ma20p = mas[20][i], mas[20][i - 1]
+    if ma20 and ma20p:
+        if c > ma20 and ma20 > ma20p:
+            _wadd("MA20", 1)
+        elif c < ma20 and ma20 < ma20p:
+            _wadd("MA20", -1)
+    try:
+        # 只用尾部160根算筹码快照：全量算1600只需数分钟且饿死GIL卡界面
+        snap = chip_snapshots(rows[-160:], tail=1).get(rows[i]["date"])
+        if snap:
+            sup_i, res_i = snap[0], snap[1]
+            if sup_i and c <= sup_i * 1.01:
+                _wadd("筹码", 1, "贴近支撑")
+            elif res_i and c >= res_i * 0.99:
+                _wadd("筹码", -1, "贴近压力")
+    except Exception:
+        pass
+    if None not in (b_up[i], b_low[i]):
+        if c < b_low[i]:
+            _wadd("布林带", 1, "布林下轨超卖")
+        elif c > b_up[i]:
+            _wadd("布林带", -1, "布林上轨超买")
+    a_i, p_i, m_i = adx_a[i], pdi_a[i], mdi_a[i]
+    if None not in (a_i, p_i, m_i) and a_i >= 20:
+        if p_i > m_i:
+            _wadd("ADX", 1, "ADX趋势偏多" if a_i >= 25 else None)
+        elif m_i > p_i:
+            _wadd("ADX", -1)
+    band = _band_fit_score(rows, mas, vr_arr)
+    return sc, reasons, band
+
+
+def daily_picks(progress=None, top_n=20, min_bars=120):
+    """每日荐股：纯本地缓存扫描，不联网。
+    返回 [(code, name, close, chg_pct, score, reasons, band)] 按 score 降序。
+    深历史库（全市场×1000+根）不能整库载入内存：先按根数初筛，
+    再分块只取每只尾部400根。"""
+    with db_conn() as conn:
+        names = {r[0]: r[1] for r in conn.execute(
+            "SELECT code, name FROM stocks").fetchall()}
+        codes = [r[0] for r in conn.execute(
+            "SELECT code FROM daily_bars GROUP BY code "
+            "HAVING COUNT(*) >= ?", (min_bars,)).fetchall()]
+    CH = 500
+    cands = []
+    for i in range(0, len(codes), CH):
+        chunk = codes[i:i + CH]
+        with db_conn() as conn:
+            ph = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"SELECT code,date,open,high,low,close,vol FROM ("
+                f"  SELECT code,date,open,high,low,close,vol,"
+                f"         ROW_NUMBER() OVER (PARTITION BY code "
+                f"                            ORDER BY date DESC) rn"
+                f"  FROM daily_bars WHERE code IN ({ph})"
+                f") WHERE rn<=400 ORDER BY code, date", chunk).fetchall()
+        by = {}
+        for c, d, o, h, l, cl, v in rows:
+            by.setdefault(c, []).append(
+                {"date": d, "open": o, "high": h, "low": l,
+                 "close": cl, "vol": v or 0.0})
+        cands += [(c, r) for c, r in by.items()
+                  if len(r) >= min_bars and not _is_etf(c)
+                  and not c.startswith('bj')          # 北交所K线源不支持
+                  and r[-1]['close'] and r[-1]['close'] >= 2]   # 剔除仙股
+        if progress:
+            progress(f"荐股载入 {min(i + CH, len(codes))}/{len(codes)}")
+    picks = []
+    total = len(cands)
+    t_start = time.time()
+    for k, (code, rws) in enumerate(cands):
+        if progress and k % 40 == 0:
+            progress(f"荐股扫描 {k}/{total}")
+            time.sleep(0.01)          # 让出GIL，防止界面卡死
+        if time.time() - t_start > 120:
+            break                     # 2分钟硬熔断：宁可少扫不卡界面
+        try:
+            r = daily_pick_score(rws[-400:])
+        except Exception:
+            continue
+        if r is None:
+            continue
+        score, reasons, band = r
+        if score < CFG.risk_params()["buy_th"]:
+            continue
+        chg = (rws[-1]["close"] / rws[-2]["close"] - 1) * 100 \
+            if rws[-1]["close"] and rws[-2]["close"] else 0.0
+        picks.append((code, names.get(code, code[-6:]),
+                      rws[-1]["close"], chg, score,
+                      " ".join(reasons) or "-", band))
+    picks.sort(key=lambda x: -x[4])
+    if progress:
+        progress(f"荐股完成：{len(picks)} 只入围，取Top{top_n}")
+    return picks[:top_n]
 
 
 def chip_snapshots(rows, nbin=80, tail=120):
@@ -1899,15 +2378,164 @@ def wpct(pairs, p):
     return pairs[-1][0]
 
 
-def _pool_match(pool_rows, cur, vr_now, idx_chg_by_date, idx_chg_today,
-                topk=TOPK):
-    """在多只股票的日K池里跑与 L1 相同的窗口匹配，返回样本列表。
+# ---- 多维匹配扩展特征 ----
 
-    pool_rows: [(code, rows)]；评分 = 形态距离 + 量能项 + 大盘环境项。
-    """
+def rsi_at(closes, i, n=14):
+    """截至第 i 日（含）的简单RSI。样本不足返回 None。"""
+    if i < n or n <= 0:
+        return None
+    gains = losses = 0.0
+    for k in range(i - n + 1, i + 1):
+        ch = closes[k] - closes[k - 1]
+        if ch > 0:
+            gains += ch
+        else:
+            losses -= ch
+    if gains + losses <= 0:
+        return None
+    if losses <= 0:
+        return 100.0
+    return 100.0 - 100.0 / (1.0 + gains / losses)
+
+
+def vola_at(rets, i, n=10):
+    """截至第 i 日（含）近 n 日对数收益标准差（日波动率）。"""
+    if i < n - 1 or n <= 1:
+        return None
+    seg = rets[i - n + 1:i + 1]
+    m = sum(seg) / n
+    return (sum((x - m) ** 2 for x in seg) / n) ** 0.5
+
+
+def candle_feats(rows, i):
+    """第 i 根K线结构特征：(实体方向占比, 上影占比, 下影占比, 收盘位置)。
+    全部归一到 -1..1 / 0..1，量纲无关。"""
+    r = rows[i]
+    o, h, l, c = r.get("open"), r.get("high"), r.get("low"), r.get("close")
+    if None in (o, h, l, c) or o <= 0 or c <= 0:
+        return None
+    rng = h - l
+    if rng <= 1e-9:
+        return (0.0, 0.0, 0.0, 0.5)
+    body = (c - o) / rng
+    up_sh = (h - max(o, c)) / rng
+    dn_sh = (min(o, c) - l) / rng
+    pos = (c - l) / rng
+    return (body, up_sh, dn_sh, pos)
+
+
+def volchg_at(vols, i, n=5):
+    """量变特征：log(近n日均量 / 前n日均量)。"""
+    if i < 2 * n - 1:
+        return None
+    cur = sum(vols[i - n + 1:i + 1]) / n
+    prev = sum(vols[i - 2 * n + 1:i - n + 1]) / n
+    if prev <= 0 or cur <= 0:
+        return None
+    return math.log(cur / prev)
+
+
+def weekly_ctx(rows, i, n=4):
+    """周线环境：截至第 i 日最近 n 周（每周5根K线近似）的周收益列表，
+    最近一周在前。样本不足返回 None。"""
+    if i + 1 < n * 5:
+        return None
+    out = []
+    for k in range(n):
+        e = i + 1 - 5 * k
+        s = e - 5
+        if s < 0:
+            return None
+        c0 = rows[s].get("close")
+        c1 = rows[e - 1].get("close")
+        if not c0 or c0 <= 0 or not c1:
+            return None
+        out.append(c1 / c0 - 1)
+    return out
+
+
+def _cur_context(rows, rets, vols, closes):
+    """计算「今日」的多维匹配特征向量（供 L1/L2/L3 共用）。"""
+    i = len(rows) - 1
+    return {
+        "struct": candle_feats(rows, i),
+        "vola": vola_at(rets, i),
+        "rsi": rsi_at(closes, i),
+        "volchg": volchg_at(vols, i),
+        "weekly": weekly_ctx(rows, i, CFG.WEEKLY_N),
+    }
+
+
+def _dist_extra(d_cur, d_i):
+    """样本与今日的扩展特征距离（结构+波动率+RSI+量变+周线）。
+    任一特征缺失时该项取中性惩罚值，保证不同样本分数可比。
+    d_cur 为 None（如渐进加载早期未计算今日特征）时全部按缺失处理。"""
+    d = 0.0
+    d_cur = d_cur or {}
+    # K线结构（4维欧氏距离/4）
+    if d_cur.get("struct") is not None and d_i.get("struct") is not None:
+        a, b = d_cur["struct"], d_i["struct"]
+        d += CFG.STRUCT_W * (sum((x - y) ** 2 for x, y in zip(a, b)) / len(a)) ** 0.5
+    else:
+        d += CFG.STRUCT_W * 0.5
+    # 波动率（对数比，封顶1.5）
+    if d_cur.get("vola") is not None and d_i.get("vola") is not None \
+            and d_cur["vola"] > 0 and d_i["vola"] > 0:
+        d += CFG.VOLA_W * min(abs(math.log(d_cur["vola"] / d_i["vola"])), 1.5)
+    else:
+        d += CFG.VOLA_W * 0.5
+    # RSI（0-100 差 / 100）
+    if d_cur.get("rsi") is not None and d_i.get("rsi") is not None:
+        d += CFG.RSI_W * abs(d_cur["rsi"] - d_i["rsi"]) / 100.0
+    else:
+        d += CFG.RSI_W * 0.5
+    # 量变（对数比，封顶1.5）
+    if d_cur.get("volchg") is not None and d_i.get("volchg") is not None:
+        d += CFG.VOLCHG_W * min(abs(d_cur["volchg"] - d_i["volchg"]), 1.5)
+    else:
+        d += CFG.VOLCHG_W * 0.5
+    # 周线环境（周收益欧氏距离，×5 放大到日级别量纲附近）
+    if d_cur.get("weekly") is not None and d_i.get("weekly") is not None:
+        a, b = d_cur["weekly"], d_i["weekly"]
+        d += CFG.WEEKLY_W * min((sum((x - y) ** 2 for x, y in zip(a, b))
+                                 / len(a)) ** 0.5 * 5, 1.5)
+    else:
+        d += CFG.WEEKLY_W * 0.5
+    return d
+
+
+def _dynamic_lv_weights(levels):
+    """按层级的有效样本质量动态分配权重，使用Top-K中位距离而非单个best。"""
+    keys = ("L1", "L2", "L3")
+    pri_tot = sum(max(0.0, LV_W.get(k, 0.0)) for k in keys) or 1.0
+    pri = {k: max(0.0, LV_W.get(k, 0.0)) / pri_tot for k in keys}
+    if not CFG.DYNAMIC_LV_W:
+        return pri
+    raw = {}
+    for k, smp in levels:
+        scores = sorted(float(s.get("similarity_score", 9.0)) for s in smp
+                        if math.isfinite(float(s.get("similarity_score", 9.0))))
+        if not scores:
+            raw[k] = 0.0
+            continue
+        med = scores[len(scores) // 2]
+        quality = math.exp(-min(med, 6.0) / 1.25)
+        n_factor = min(1.0, math.sqrt(len(scores) / 6.0))
+        raw[k] = quality * (0.65 + 0.35 * n_factor)
+    tot = sum(raw.values())
+    if tot <= 0:
+        return pri
+    dyn = {k: raw.get(k, 0.0) / tot for k in keys}
+    st = min(max(CFG.DYN_LV_STRENGTH, 0.0), 1.0)
+    return {k: (1.0 - st) * pri[k] + st * dyn.get(k, 0.0) for k in keys}
+
+
+def _pool_match(pool_rows, cur, vr_now, idx_chg_by_date, idx_chg_today,
+                topk=TOPK, candidate_topk=None, cur_ctx=None):
+    """多股票池历史窗口匹配；只用样本T及以前的信息，目标收益绝不参与筛选。"""
     W = W_WINDOW
-    info = {}
-    sims = []
+    candidate_topk = candidate_topk or CFG.CANDIDATE_TOPK
+    info, sims = {}, []
     for code, rows in pool_rows:
         closes = [r["close"] for r in rows]
         rets = logret(closes, is_etf=_is_etf(code))
@@ -1916,55 +2544,80 @@ def _pool_match(pool_rows, cur, vr_now, idx_chg_by_date, idx_chg_today,
         vols = [r.get("vol") or 0.0 for r in rows]
         vr_arr = [vol_ratio_at(vols, k) for k in range(len(vols))]
         info[code] = (rows, vr_arr)
-        for i in range(W, len(rets) - 1):
-            w = znorm(rets[i - W:i])
-            d_px = sum((a - b) ** 2 for a, b in zip(cur, w)) ** 0.5
+        smp_ctx = {
+            "struct": [candle_feats(rows, k) for k in range(len(rows))],
+            "vola": [vola_at(rets, k) for k in range(len(rets))],
+            "rsi": [rsi_at(closes, k) for k in range(len(closes))],
+            "volchg": [volchg_at(vols, k) for k in range(len(vols))],
+            "weekly": [weekly_ctx(rows, k, CFG.WEEKLY_N) for k in range(len(rows))],
+        }
+        last_i = len(rets) - W
+        # d_px 向量化（_px_distances 内部 numpy 可用时快约50倍）；
+        # s_v/s_i 廉价可全量算；d_x 较贵 → 先按 d_px+s_v+s_i 预筛
+        # top(4K+80) 再补算 d_x（d_x 上界约3.6，截断误差可忽略）
+        d_px_arr = _px_distances(rets, cur, W)
+        pre = []
+        for k, d_px in enumerate(d_px_arr):
+            i = k + W
+            if i > last_i:
+                break
             vr_i = vr_arr[i]
-            if vr_now is not None and vr_i is not None:
-                d_v = abs(math.log(max(vr_now, 1e-6) / max(vr_i, 1e-6)))
-                s_v = 0.6 * min(d_v, 2.5)
-            else:
-                s_v = 0.30
+            s_v = 0.6 * min(abs(math.log(max(vr_now,1e-6)/max(vr_i,1e-6))),2.5) if vr_now is not None and vr_i is not None else 0.30
             ic = idx_chg_by_date.get(rows[i]["date"])
-            if ic is not None and idx_chg_today is not None:
-                s_i = min(1.5, 0.3 * abs(ic - idx_chg_today))
-            else:
-                s_i = 0.40
-            sims.append((d_px + s_v + s_i, i, code))
+            s_i = min(1.5,0.3*abs(ic-idx_chg_today)) if ic is not None and idx_chg_today is not None else 0.40
+            pre.append((d_px + s_v + s_i, i, d_px, s_v, s_i))
+        pre.sort(key=lambda x: x[0])
+        for base_s, i, d_px, s_v, s_i in pre[:candidate_topk * 4 + 80]:
+            d_x = _dist_extra(cur_ctx,{k:smp_ctx[k][i] for k in smp_ctx})
+            sims.append((base_s+d_x,i,code,d_px,s_v,s_i))
     if not info:
         return []
-    top = heapq.nsmallest(topk, sims, key=lambda x: x[0])
-    out = []
-    max_pred_days = 10
-    for score, i, code in top:
-        rows, vr_arr = info[code]
-        r = rows[i]
-        ic = idx_chg_by_date.get(r["date"])
-        sample = {
-            "t_date": r["date"],
-            "vr": vr_arr[i],
-            "idx_chg": (ic - idx_chg_today
-                        if (ic is not None and idx_chg_today is not None)
-                        else None),
-            "gap": rows[i + 1]["open"] / r["close"] - 1 if i + 1 < len(rows) else None,
-            "code": code,
-        }
-        # 扩展样本：记录T+1到T+max_pred_days的相对前日收盘涨跌幅
-        for d in range(1, max_pred_days + 1):
-            if i + d < len(rows):
-                nd = rows[i + d]
-                prev_c = rows[i + d - 1]["close"] if i + d - 1 >= 0 else r["close"]
-                sample[f"n{d}_date"] = nd["date"]
-                sample[f"n{d}_cl"] = nd["close"] / prev_c - 1
-                sample[f"n{d}_hi"] = nd["high"] / prev_c - 1
-                sample[f"n{d}_lo"] = nd["low"] / prev_c - 1
+    candidate = heapq.nsmallest(candidate_topk,sims,key=lambda x:x[0])
+    if not candidate:
+        return []
+    best = candidate[0][0]
+    out=[]
+    for score,i,code,d_px,s_v,s_i in candidate:
+        rows,vr_arr=info[code]; r=rows[i]; ic=idx_chg_by_date.get(r["date"])
+        # 消融回测(n=1480)：指数加权命中50.4%/IC-0.043 → 等权52.4%/IC+0.020，
+        # 默认关闭；如需启用把 CFG.SIMILARITY_WEIGHTING 改回 True
+        weight = math.exp(-min(max(0.0, score - best), 6.0) / 0.9) \
+            if CFG.SIMILARITY_WEIGHTING else 1.0
+        if CFG.QUALITY_FILTER and d_px>CFG.SIMILARITY_CUTOFF:
+            weight*=0.35
+        # 时间衰减（消融回测：保留衰减 IC+0.020 vs 无衰减 -0.024）
+        if CFG.TIME_DECAY_ENABLED:
+            try:
+                age=(time.mktime(time.strptime(time.strftime("%Y-%m-%d"),"%Y-%m-%d"))
+                     -time.mktime(time.strptime(r["date"],"%Y-%m-%d")))/86400.0
+                if age>CFG.TIME_DECAY_DAYS:
+                    weight*=max(CFG.TIME_DECAY_RATE,
+                                1.0-(age-CFG.TIME_DECAY_DAYS)/365.0*0.5)
+            except (ValueError, TypeError):
+                pass
+        s={"t_date":r["date"],"vr":vr_arr[i],
+           "idx_chg":ic-idx_chg_today if ic is not None and idx_chg_today is not None else None,
+           "gap":rows[i+1]["open"]/r["close"]-1 if i+1<len(rows) else None,
+           "code":code,"_match_i":i,"similarity_score":score,
+           "distance_px":d_px,"distance_vol":s_v,"distance_idx":s_i,"weight":weight}
+        for d in range(1,11):
+            if i+d<len(rows):
+                nd=rows[i+d]; prev_c=rows[i+d-1]["close"]; op=nd.get("open") or prev_c
+                s[f"n{d}_date"]=nd["date"]; s[f"n{d}_cl"]=nd["close"]/prev_c-1
+                s[f"n{d}_hi"]=nd["high"]/prev_c-1; s[f"n{d}_lo"]=nd["low"]/prev_c-1
+                s[f"n{d}_oc"]=nd["close"]/op-1 if op>0 else None
+                s[f"n{d}_oh"]=nd["high"]/op-1 if op>0 else None
+                s[f"n{d}_ol"]=nd["low"]/op-1 if op>0 else None
             else:
-                sample[f"n{d}_date"] = None
-                sample[f"n{d}_cl"] = None
-                sample[f"n{d}_hi"] = None
-                sample[f"n{d}_lo"] = None
-        out.append(sample)
-    return out
+                for suf in ("date","cl","hi","lo","oc","oh","ol"): s[f"n{d}_{suf}"]=None
+        out.append(s)
+    selected=[]; per_code={}; min_gap=max(3,W//2)
+    for s in sorted(out,key=lambda x:x["similarity_score"]):
+        c=s["code"]; i=s["_match_i"]
+        if any(abs(i-j)<min_gap for j in per_code.get(c,[])): continue
+        per_code.setdefault(c,[]).append(i); selected.append(s)
+        if len(selected)>=topk: break
+    return selected
 
 
 def market_phase_text(time_str):
@@ -1986,11 +2639,12 @@ def market_phase_text(time_str):
 
 
 def _load_pools(pool_info, cur, vr_now, idx_chg_by_date, idx_chg_today,
-                progress=None):
+                progress=None, cur_ctx=None):
     """取 L2/L3 池K线（走缓存增量）并跑匹配，返回 {"L2":[...], "L3":[...]}。"""
     out = {}
     t0 = time.time()
-    for key in ("L2", "L3"):
+    lv_keys = ("L2", "L3") if CFG.ENABLE_L3 else ("L2",)
+    for key in lv_keys:
         if time.time() - t0 > 60:
             break
         codes = pool_info.get(key.lower()) or []
@@ -2005,7 +2659,7 @@ def _load_pools(pool_info, cur, vr_now, idx_chg_by_date, idx_chg_today,
                 cached = _db_rows_batch(conn, codes)
             pool_rows = [(c, r) for c, r in cached.items() if len(r) >= 130]
             smp = _pool_match(pool_rows, cur, vr_now, idx_chg_by_date,
-                              idx_chg_today)
+                              idx_chg_today, cur_ctx=cur_ctx)
             if smp:
                 out[key] = smp
         except Exception:
@@ -2038,18 +2692,25 @@ def load_pools_progressive(full, ctx, progress=None, batch=12):
     if not pool_info:
         return
     level_map = {}
-    order = [("L2", pool_info.get("l2") or []),
-             ("L3", pool_info.get("l3") or [])]
+    order = ([("L2", pool_info.get("l2") or [])]
+             + ([("L3", pool_info.get("l3") or [])] if CFG.ENABLE_L3 else []))
     for key, codes in order:
         if not codes:
             continue
         t0 = time.time()
         acc_rows = []       # 本级的累计池K线，逐批变大，匹配随之变准
         matched_n = 0       # 上次跑匹配时的池大小（自适应降频）
-        for i in range(0, len(codes), batch):
+        n_batches = (len(codes) + batch - 1) // batch
+        for bi, i in enumerate(range(0, len(codes), batch), 1):
             chunk = codes[i:i + batch]
+            if progress:
+                progress(f"后台加载{LV_LABEL[key]}样本 "
+                         f"{min(i + batch, len(codes))}/{len(codes)}只 "
+                         f"({min((i + batch) * 100 // len(codes), 100)}%) "
+                         f"第{bi}/{n_batches}批...")
             try:
-                prefetch(chunk, workers=8, progress=progress)
+                # 进度由上面的批次消息统一汇报，避免内层"缓存回填"刷屏
+                prefetch(chunk, workers=8)
             except Exception:
                 log.warning("样本池回填失败 %s(跳过)", chunk, exc_info=True)
             # 批量读缓存
@@ -2059,6 +2720,11 @@ def load_pools_progressive(full, ctx, progress=None, batch=12):
             except Exception:
                 cached = {}
             acc_rows += [(c, r) for c, r in cached.items() if len(r) >= 130]
+            if progress:
+                progress(f"后台加载{LV_LABEL[key]}样本 "
+                         f"{len(acc_rows)}/{len(codes)}只有效 "
+                         f"(第{bi}/{n_batches}批，"
+                         f"{bi * 100 // n_batches}%)")
             # 池大了以后每批全量匹配太慢：新增≥24只有效K线才重跑一次
             if len(acc_rows) < matched_n + 24:
                 continue
@@ -2066,7 +2732,8 @@ def load_pools_progressive(full, ctx, progress=None, batch=12):
             # 用已累计的全部本池K线跑匹配，样本随加载增多而变准
             try:
                 smp = _pool_match(acc_rows, ctx["cur"], ctx["vr_now"],
-                                  ctx["idx_chg_by_date"], ctx["idx_chg_today"])
+                                  ctx["idx_chg_by_date"], ctx["idx_chg_today"],
+                                  cur_ctx=ctx.get("cur_ctx"))
                 if smp:
                     level_map[key] = smp
             except Exception:
@@ -2086,64 +2753,648 @@ def load_pools_progressive(full, ctx, progress=None, batch=12):
                 pool_note = "样本池: " + "+".join(parts)
                 yield level_map, t_pred, pred, clamped, tpred_bar, pool_note, multi_pred
             if time.time() - t0 > 60:   # 单级超时保护（L3不限量后池更大）
+                if progress:
+                    progress(f"{LV_LABEL[key]}池加载超时(60s)，"
+                             f"已用{len(acc_rows)}只K线继续")
                 break
+        if progress:
+            progress(f"{LV_LABEL[key]}池完成: {len(level_map.get(key, []))}个匹配样本")
+
+
+# ================= 策略消融引擎（多算法回测+防过拟合选型） =================
+# 每次分析对该股近1000交易日做一次多算法消融回测：
+#   候选 = L1形态up_prob / MACD / KDJ / RSI / 布林带 / MA20-60趋势 / 多维评分×3风险档
+# 防过拟合：前~75%训练集选策略，后~25%验证集只报告不参与选择（前视零容忍：
+# 信号只用 T 日及以前数据，信号日收盘成交）。结果缓存 meta 表，5日过期。
+
+STRAT_TTL = 5 * 86400
+
+
+def _strat_key(full):
+    return "strategy:" + full
+
+
+def load_strategy(full):
+    """读策略缓存（meta表），5日过期返回 None。"""
+    try:
+        with db_conn() as conn:
+            v = _get_meta(conn, _strat_key(full))
+        if not v:
+            return None
+        d = json.loads(v)
+        if time.time() - float(d.get("ts", 0)) > STRAT_TTL:
+            return None
+        return d
+    except Exception:
+        log.exception("load_strategy 失败(忽略)")
+        return None
+
+
+def save_strategy(full, strat):
+    try:
+        strat = dict(strat)
+        strat["ts"] = time.time()
+        with db_conn(commit=True) as conn:
+            _set_meta(conn, _strat_key(full),
+                      json.dumps(strat, ensure_ascii=False))
+    except Exception:
+        log.exception("save_strategy 失败(忽略)")
+
+
+# ---- 各算法信号发生器（只用 T 日及以前数据，杜绝前视）----
+
+def _sig_macd(rows):
+    closes = [r["close"] for r in rows]
+    dif, dea, _ = calc_macd(closes)
+    out = []
+    for i in range(9, len(rows)):
+        if None in (dif[i], dea[i], dif[i - 1], dea[i - 1]):
+            continue
+        if dif[i - 1] <= dea[i - 1] and dif[i] > dea[i]:
+            out.append((i, rows[i]["date"], "BUY", "MACD金叉"))
+        elif dif[i - 1] >= dea[i - 1] and dif[i] < dea[i]:
+            out.append((i, rows[i]["date"], "SELL", "MACD死叉"))
+    return out
+
+
+def _sig_kdj(rows):
+    k, d, _ = calc_kdj(rows)
+    out = []
+    for i in range(3, len(rows)):
+        if None in (k[i], d[i], k[i - 1], d[i - 1]):
+            continue
+        if k[i - 1] <= d[i - 1] and k[i] > d[i] and k[i] < 45:
+            out.append((i, rows[i]["date"], "BUY", "KDJ低位金叉"))
+        elif k[i - 1] >= d[i - 1] and k[i] < d[i] and k[i] > 65:
+            out.append((i, rows[i]["date"], "SELL", "KDJ高位死叉"))
+    return out
+
+
+def _sig_rsi(rows):
+    closes = [r["close"] for r in rows]
+    r6 = calc_rsi(closes, 6)
+    out = []
+    for i in range(1, len(rows)):
+        if r6[i] is None or r6[i - 1] is None:
+            continue
+        if r6[i - 1] < 20 <= r6[i]:
+            out.append((i, rows[i]["date"], "BUY", "RSI超卖回升"))
+        elif r6[i - 1] > 80 >= r6[i]:
+            out.append((i, rows[i]["date"], "SELL", "RSI超买回落"))
+    return out
+
+
+def _sig_boll(rows):
+    closes = [r["close"] for r in rows]
+    _, up, low = calc_boll(closes)
+    out = []
+    for i in range(1, len(rows)):
+        if None in (up[i], low[i], up[i - 1], low[i - 1]):
+            continue
+        pc = rows[i - 1]["close"]
+        c = rows[i]["close"]
+        if pc <= low[i - 1] and c > low[i]:
+            out.append((i, rows[i]["date"], "BUY", "布林下轨回升"))
+        elif pc >= up[i - 1] and c < up[i]:
+            out.append((i, rows[i]["date"], "SELL", "布林上轨回落"))
+    return out
+
+
+def _sig_ma_trend(rows):
+    closes = [r["close"] for r in rows]
+    ma20 = sma_period(closes, 20)
+    ma60 = sma_period(closes, 60)
+    out = []
+    state = 0
+    for i in range(60, len(rows)):
+        if None in (ma20[i], ma60[i], ma20[i - 1], ma60[i - 1]):
+            continue
+        if ma20[i - 1] <= ma60[i - 1] and ma20[i] > ma60[i] and state != 1:
+            out.append((i, rows[i]["date"], "BUY", "MA20上穿MA60"))
+            state = 1
+        elif ma20[i - 1] >= ma60[i - 1] and ma20[i] < ma60[i] and state != -1:
+            out.append((i, rows[i]["date"], "SELL", "MA20下穿MA60"))
+            state = -1
+    return out
+
+
+def _composite_signals(rows, rp, idx_chg_by_date=None, chip_tail=400):
+    """多维评分信号（消融用，与GUI打分同构；筹码维度限尾段提速）。
+    rp: 风险参数（buy_th/cooldown）。返回 [(i,date,"BUY"/"SELL",reason)]。"""
+    n = len(rows)
+    if n < 60:
+        return []
+    closes = [r["close"] for r in rows]
+    dif, dea, _ = calc_macd(closes)
+    k_, d_, _ = calc_kdj(rows)
+    r6 = calc_rsi(closes, 6)
+    _, b_up, b_low = calc_boll(closes)
+    pdi_a, mdi_a, adx_a = calc_adx(rows)
+    ma20 = sma_period(closes, 20)
+    vols_d = [r.get("vol") or 0.0 for r in rows]
+    try:
+        chip_snaps = chip_snapshots(rows, tail=chip_tail)
+    except Exception:
+        chip_snaps = {}
+    weak = idx_chg_by_date or {}
+    buy_th = rp["buy_th"]
+    out = []
+    prev_dir = 0
+    cooldown = 0
+    start = max(1, n - 1000)
+    for i in range(start, n):
+        if cooldown > 0:
+            cooldown -= 1
+            continue
+        if None in (dif[i], dea[i], dif[i - 1], dea[i - 1]):
+            continue
+        sc = 0
+
+        def _wadd(dim, pts):
+            return int(round(pts * CFG.IND_W.get(dim, 1.0)))
+
+        sc += _wadd("MACD", 2 if (dif[i - 1] <= dea[i - 1] and dif[i] > dea[i])
+                    else -2 if (dif[i - 1] >= dea[i - 1] and dif[i] < dea[i])
+                    else 1 if dif[i] > dea[i] else -1)
+        sc += _wadd("KDJ", 2 if (k_[i - 1] <= d_[i - 1] and k_[i] > d_[i]
+                                 and k_[i] < 45)
+                    else -2 if (k_[i - 1] >= d_[i - 1] and k_[i] < d_[i]
+                                and k_[i] > 65)
+                    else 1 if k_[i] > d_[i] else -1)
+        if r6[i] is not None and r6[i - 1] is not None:
+            sc += _wadd("RSI", 2 if (r6[i - 1] < 20 and r6[i] >= 20)
+                        else -2 if (r6[i - 1] > 80 and r6[i] <= 80)
+                        else 1 if r6[i] < 30 else -1 if r6[i] > 70 else 0)
+        c, cp = rows[i]["close"], rows[i - 1]["close"]
+        v5 = sum(vols_d[max(0, i - 5):i]) / max(1, min(5, i))
+        vr_d = vols_d[i] / v5 if v5 > 0 else 0.0
+        sc += _wadd("量价", 1 if (vr_d > 1.5 and c > cp)
+                    else -1 if (vr_d > 1.5 and c < cp) else 0)
+        m20, m20p = ma20[i], ma20[i - 1]
+        if m20 and m20p:
+            sc += _wadd("MA20", 1 if (c > m20 and m20 > m20p)
+                        else -1 if (c < m20 and m20 < m20p) else 0)
+        snap = chip_snaps.get(rows[i]["date"])
+        if snap:
+            sup_i, res_i = snap[0], snap[1]
+            if sup_i and c <= sup_i * 1.01:
+                sc += _wadd("筹码", 1)
+            elif res_i and c >= res_i * 0.99:
+                sc += _wadd("筹码", -1)
+        if None not in (b_up[i], b_low[i]):
+            sc += _wadd("布林带", 1 if c < b_low[i]
+                        else -1 if c > b_up[i] else 0)
+        a_i, p_i, m_i = adx_a[i], pdi_a[i], mdi_a[i]
+        if None not in (a_i, p_i, m_i) and a_i >= 20:
+            sc += _wadd("ADX", 1 if p_i > m_i else -1)
+        day_weak = (weak.get(rows[i]["date"]) is not None
+                    and weak[rows[i]["date"]] < CFG.WEAK_IDX_TH)
+        th = buy_th + 1 if day_weak else buy_th
+        if sc >= th and prev_dir <= 0:
+            out.append((i, rows[i]["date"], "BUY", f"多维偏多({sc})"))
+            prev_dir = 1
+            cooldown = rp["cooldown"]
+        elif sc <= CFG.SIGNAL_SCORE_SELL and prev_dir >= 0:
+            out.append((i, rows[i]["date"], "SELL", f"多维偏空({sc})"))
+            prev_dir = -1
+            cooldown = rp["cooldown"]
+    return out
+
+
+ALGO_LABEL = {
+    "l1_pattern": "L1形态上行概率",
+    "macd": "MACD金叉/死叉",
+    "kdj": "KDJ金叉/死叉",
+    "rsi": "RSI超买超卖",
+    "boll": "布林带回归",
+    "ma_trend": "MA20/60趋势",
+    "composite": "多维评分",
+}
+
+
+def _px_distances(rets, cur, W):
+    """滑窗z-normalize后与cur的欧氏距离：返回数组（窗口k=rets[k:k+W]）。
+    numpy可用时向量化（快约50倍），否则退回纯Python循环。"""
+    n = len(rets)
+    if n < W:
+        return []
+    if np is not None:
+        a = np.asarray(rets, dtype=np.float64)
+        wins = np.lib.stride_tricks.sliding_window_view(a, W)
+        mu = wins.mean(axis=1, keepdims=True)
+        sd = wins.std(axis=1, keepdims=True)
+        zn = (wins - mu) / np.maximum(sd, 1e-12)
+        d = np.sqrt(((zn - np.asarray(cur)) ** 2).sum(axis=1))
+        return d.tolist()
+    out = []
+    for k in range(n - W + 1):
+        w = znorm(rets[k:k + W])
+        out.append(math.sqrt(sum((a - b) ** 2 for a, b in zip(cur, w))))
+    return out
+
+
+def _sig_l1_pattern(rows, W=None, step=5, up_th=0.6, dn_th=0.4):
+    """L1形态信号：每隔step日做一次自身历史形态匹配（只用该日以前数据），
+    Top-K样本次日上行概率≥60%→BUY，≤40%→SELL。"""
+    W = W or W_WINDOW
+    closes = [r["close"] for r in rows]
+    rets = logret(closes)
+    if len(rets) < 2 * W + 3:
+        return []
+    out = []
+    for i in range(W, len(rets) - W + 1, step):
+        cur = znorm(rets[i - W:i])
+        d_arr = _px_distances(rets[:i], cur, W)   # 仅用 i 以前窗口（防前视）
+        cand = [(d_arr[k], k) for k in range(len(d_arr))
+                if k + W <= i - W]                # 样本窗口完整结束于 i 之前
+        if len(cand) < 6:
+            continue
+        cand.sort()
+        tops = cand[:CFG.TOPK]
+        ups = tot = 0
+        for _, k in tops:
+            j = k + W                              # 窗口次日起算结果
+            if j < len(rows) - 1:
+                tot += 1
+                if rows[j + 1]["close"] > rows[j]["close"]:
+                    ups += 1
+        if tot < 5:
+            continue
+        p = ups / tot
+        if p >= up_th:
+            out.append((i, rows[i]["date"], "BUY",
+                        f"L1形态上行{p*100:.0f}%"))
+        elif p <= dn_th:
+            out.append((i, rows[i]["date"], "SELL",
+                        f"L1形态上行{p*100:.0f}%"))
+    return out
+
+
+# ---- 区间事件回测（信号日收盘成交 + ATR止损/移动止盈，防前视）----
+
+def _bt_events(rows, signals, rp, i0=0, i1=None):
+    """在 rows[i0:i1] 上模拟交易。返回指标dict；交易数不足返回 None。"""
+    i1 = len(rows) if i1 is None else min(i1, len(rows))
+    if i1 - i0 < 30:
+        return None
+    sig_map = {s[0]: s[2] for s in signals if i0 <= s[0] < i1}
+    # ATR(14) 预计算
+    atrs = [0.0] * len(rows)
+    for i in range(i0 + 14, i1):
+        s = 0.0
+        for j in range(i - 13, i + 1):
+            h, l, pc = rows[j]["high"], rows[j]["low"], rows[j - 1]["close"]
+            s += max(h - l, abs(h - pc), abs(l - pc))
+        atrs[i] = s / 14
+    eq = 1.0
+    entry = None
+    highest = None
+    trades = []
+    curve = []
+    for i in range(i0, i1):
+        r = rows[i]
+        c, h, l = r["close"], r["high"], r["low"]
+        typ = sig_map.get(i)
+        if entry is not None:
+            highest = max(highest, h) if highest else h
+            atr_stop = (entry - rp["atr_mult"] * atrs[i]) if atrs[i] > 0 \
+                else entry * 0.95
+            trail_stop = (highest * rp["trail_ratio"]
+                          if highest > entry * rp["trail_trigger"]
+                          else atr_stop)
+            if l <= trail_stop:
+                exit_px = min(trail_stop, h)
+                trades.append(exit_px / entry - 1)
+                eq *= exit_px / entry
+                entry = None
+                highest = None
+        if typ == "BUY" and entry is None and c:
+            entry = c
+            highest = h
+        elif typ == "SELL" and entry:
+            trades.append(c / entry - 1)
+            eq *= c / entry
+            entry = None
+            highest = None
+        curve.append(eq * (c / entry) if entry else eq)
+    if len(trades) < 2:
+        return None
+    wins = len([t for t in trades if t > 0])
+    import datetime
+    try:
+        d0 = datetime.date.fromisoformat(rows[i0]["date"])
+        d1 = datetime.date.fromisoformat(rows[i1 - 1]["date"])
+        years = max((d1 - d0).days / 365.25, 0.25)
+    except Exception:
+        years = max((i1 - i0) / 250.0, 0.25)
+    total = curve[-1] if curve else 1.0
+    ann = total ** (1 / years) - 1 if total > 0 else -1.0
+    peak, mdd = 0.0, 0.0
+    for v in curve:
+        peak = max(peak, v)
+        if peak > 0:
+            mdd = min(mdd, v / peak - 1)
+    return {"trades": len(trades), "wins": wins,
+            "winrate": wins / len(trades),
+            "total": total - 1, "ann": ann, "mdd": mdd,
+            "curve": curve, "i0": i0}
+
+
+def _regime_map(idx_rows, n):
+    """牛市/熊市日历：指数收盘 ≥ MA120 视为牛市。返回 {date: bool}。"""
+    closes = [r["close"] for r in (idx_rows or [])]
+    if len(closes) < 130:
+        return {}
+    ma = sma_period(closes, 120)
+    out = {}
+    for r, m in zip(idx_rows, ma):
+        if m:
+            out[r["date"]] = r["close"] >= m
+    return out
+
+
+def _bull_bear_score(rows, curve, i0, regime):
+    """分段年化收益：牛市段/熊市段（无数据段返回 None）。"""
+    if not regime or not curve:
+        return None, None
+    bull_r, bear_r = [], []
+    prev = None
+    for k, i in enumerate(range(i0, min(i0 + len(curve), len(rows)))):
+        day = rows[i]["date"]
+        reg = regime.get(day)
+        if prev is not None and prev[1] > 0:
+            r = curve[k] / prev[1] - 1
+            if reg is True:
+                bull_r.append(r)
+            elif reg is False:
+                bear_r.append(r)
+        prev = (day, curve[k])
+    def _ann(rets):
+        if len(rets) < 20:
+            return None
+        s = 0.0
+        for r in rets:
+            s += math.log1p(max(-0.95, min(r, 0.95)))
+        n = len(rets)
+        return math.expm1(s * 252.0 / n)
+    return _ann(bull_r), _ann(bear_r)
+
+
+def run_ablation(full, rows, idx_rows=None, progress=None):
+    """多算法消融回测（近1000交易日）。训练集选策略/验证集验证，防过拟合。
+
+    返回 {"mode_candidates": {保守:strat, 稳健:strat, 激进:strat},
+          "ts": ..., "bars": n, "train_n":, "val_n":} 或 None。
+    strat = {"algo","mode","params","train","val","bull","bear","label"}"""
+    rows = [r for r in rows if r.get("close") and r["close"] > 0]
+    if len(rows) > 1000:
+        rows = rows[-1000:]
+    if len(rows) < 200:
+        return None
+    n = len(rows)
+    val_n = max(200, n // 4)
+    split = n - val_n
+    regime = _regime_map(idx_rows, n)
+    # 各算法信号（只生成一次）
+    gens = {
+        "macd": lambda: _sig_macd(rows),
+        "kdj": lambda: _sig_kdj(rows),
+        "rsi": lambda: _sig_rsi(rows),
+        "boll": lambda: _sig_boll(rows),
+        "ma_trend": lambda: _sig_ma_trend(rows),
+        "l1_pattern": lambda: _sig_l1_pattern(rows),
+    }
+    if progress:
+        progress("策略消融回测中(近1000交易日)...")
+    cands = []
+    base = dict(CFG.risk_params())
+    for algo, gen in gens.items():
+        try:
+            sigs = gen()
+        except Exception:
+            log.warning("消融信号生成失败 %s", algo, exc_info=True)
+            continue
+        if not sigs:
+            continue
+        for mode, rp in CFG.RISK_PARAMS.items():
+            tr = _bt_events(rows, sigs, rp, 0, split)
+            va = _bt_events(rows, sigs, rp, split, n)
+            if not tr:
+                continue
+            bull, bear = _bull_bear_score(
+                rows, tr["curve"], tr["i0"], regime)
+            cands.append({"algo": algo, "mode": mode, "params": dict(rp),
+                          "label": f"{ALGO_LABEL.get(algo, algo)}·{mode}",
+                          "train": {k: v for k, v in tr.items()
+                                    if k != "curve"},
+                          "val": ({k: v for k, v in va.items()
+                                   if k != "curve"} if va else None),
+                          "bull": bull, "bear": bear})
+    # 多维评分 × 3风险档
+    for mode, rp in CFG.RISK_PARAMS.items():
+        try:
+            sigs = _composite_signals(rows, rp, idx_chg_by_date=None)
+        except Exception:
+            log.warning("composite信号生成失败 %s", mode, exc_info=True)
+            continue
+        if not sigs:
+            continue
+        tr = _bt_events(rows, sigs, rp, 0, split)
+        va = _bt_events(rows, sigs, rp, split, n)
+        if not tr:
+            continue
+        bull, bear = _bull_bear_score(rows, tr["curve"], tr["i0"], regime)
+        cands.append({"algo": "composite", "mode": mode,
+                      "params": dict(rp),
+                      "label": f"多维评分·{mode}",
+                      "train": {k: v for k, v in tr.items() if k != "curve"},
+                      "val": ({k: v for k, v in va.items() if k != "curve"}
+                              if va else None),
+                      "bull": bull, "bear": bear})
+    if not cands:
+        return None
+    # 训练集选型（验证集绝不参与选择），每档最少3笔交易
+    def _pick(key):
+        pool = [c for c in cands if c["train"]["trades"] >= 3]
+        if not pool:
+            pool = cands
+        comp = [c for c in pool if c["algo"] == "composite"
+                and c["mode"] == "稳健"]
+        if key == "保守":
+            pool.sort(key=lambda c: (c["train"]["mdd"],
+                                     -c["train"]["winrate"]))
+        elif key == "激进":
+            pool.sort(key=lambda c: -c["train"]["ann"])
+        else:   # 稳健：收益回撤比
+            pool.sort(key=lambda c: -(c["train"]["ann"]
+                                      / max(abs(c["train"]["mdd"]), 0.05)))
+        return dict(pool[0]) if pool[0] else dict(comp[0])
+
+    out = {"mode_candidates": {"保守": _pick("保守"), "稳健": _pick("稳健"),
+                               "激进": _pick("激进")},
+           "ts": time.time(), "bars": n, "train_n": split,
+           "val_n": n - split}
+    if progress:
+        progress(f"策略消融完成：{len(cands)}个候选 (训练{split}/验证{n - split})")
+    return out
 
 
 # ================= 分析 =================
 
 def _fusion_prediction(o_today, pre_open, live, levels):
-    """三级加权融合预测：由 levels=[("L1",样本),...] 计算预测区间与预测K线。
-    供 analyze 与后台增量加载器复用（增量加载时只重算这段，K线实时更新）。"""
-    tot_w = sum(LV_W[k] for k, _ in levels) or 1.0
-
+    """三级融合。盘中用open->close分布；盘前/收盘后用close->next-close分布。"""
+    LW=_dynamic_lv_weights(levels); tot_w=sum(LW.get(k,0.0) for k,_ in levels) or 1.0
+    target=("oc","oh","ol") if live is not None else ("cl","hi","lo")
     def _wfield(field):
-        pairs = []
-        for k, smp in levels:
-            w = LV_W[k] / tot_w / len(smp)
-            pairs.extend((s[field], w) for s in smp if s.get(field) is not None)
+        pairs=[]
+        for k,smp in levels:
+            lw=LW.get(k,0.0)/tot_w; valid=[s for s in smp if s.get(field) is not None]
+            tw=sum(max(1e-9,s.get("weight",1.0)) for s in valid) or 1.0
+            pairs.extend((s[field],lw*s.get("weight",1.0)/tw) for s in valid)
         return pairs
-
-    PS = (10, 25, 50, 75, 90)
-    t_pred = {
-        "cl": {p: o_today * (1 + wpct(_wfield("n1_cl"), p)) for p in PS},
-        "hi": {p: o_today * (1 + wpct(_wfield("n1_hi"), p)) for p in PS},
-        "lo": {p: o_today * (1 + wpct(_wfield("n1_lo"), p)) for p in PS},
-        "up_prob": sum(LV_W[k] / tot_w
-                       * len([s for s in smp if s.get("n1_cl") is not None and s["n1_cl"] > 0]) / len(smp)
-                       for k, smp in levels),
-    }
-    base = t_pred["cl"][50]
-    # 盘中实时修正：预测区间必须包含已实现的最高/最低
-    clamped = False
+    PS=(10,25,50,75,90); cf,hf,lf=(f"n1_{x}" for x in target)
+    cp,hp,lp=_wfield(cf),_wfield(hf),_wfield(lf)
+    if not cp:
+        # 无有效样本：输出平线预测而非空区间，保证报告/图表不崩
+        ps=(10,25,50,75,90)
+        flat={"cl":{p:o_today for p in ps},"hi":{p:o_today for p in ps},
+              "lo":{p:o_today for p in ps},"up_prob":0.5,"confidence":None}
+        return (flat,
+                {"date":"T+1预测","open":o_today,"close":o_today,
+                 "high":o_today,"low":o_today,"vol":None,
+                 "confidence":None},
+                False, None)
+    # 区间校准（INTERVAL_K，n=4500标定）：分位偏离P50放大，消除过窄
+    K=CFG.INTERVAL_K
+    c50=wpct(cp,50); h50=wpct(hp or cp,50); l50=wpct(lp or cp,50)
+    t_pred={"cl":{p:o_today*(1+c50+K*(wpct(cp,p)-c50)) for p in PS},
+            "hi":{p:o_today*(1+h50+K*(wpct(hp or cp,p)-h50)) for p in PS},
+            "lo":{p:o_today*(1+l50+K*(wpct(lp or cp,p)-l50)) for p in PS},
+            "up_prob":sum(w for v,w in cp if v>0)}
+    confidence=_calculate_confidence(levels); t_pred["confidence"]=confidence
+    # ---- T+5 累计预测：样本 close→close 5日累计（n1..n5全有才计入）----
+    def _cum5(s):
+        f=[s.get(f"n{d}_cl") for d in range(1,6)]
+        if any(x is None for x in f):
+            return None
+        c=1.0
+        for x in f:
+            c*=(1+x)
+        return c-1.0
+    t5pairs=[]
+    for k,smp in levels:
+        lw=LW.get(k,0.0)/tot_w
+        v=[(c,s.get("weight",1.0)) for s in smp if (c:=_cum5(s)) is not None]
+        if not v:
+            continue
+        tw=sum(w for _,w in v) or 1.0
+        t5pairs.extend((c, lw*w/tw) for c,w in v)
+    if t5pairs:
+        K5=CFG.INTERVAL_K5
+        c50=wpct(t5pairs,50)
+        t5={"cl":{p:o_today*(1+c50+K5*(wpct(t5pairs,p)-c50)) for p in PS},
+            "up_prob":sum(w for v,w in t5pairs if v>0),"n":len(t5pairs)}
+        t_pred["t5"]=t5
+    else:
+        t_pred["t5"]=None
+    clamped=False
     if live is not None:
-        clamped = True
+        clamped=True
         for pp in PS:
-            t_pred["hi"][pp] = round(max(t_pred["hi"][pp], live["high"]), 2)
-            t_pred["lo"][pp] = round(min(t_pred["lo"][pp], live["low"]), 2)
-    pred = {"date": "T日预测" if pre_open else "T+1预测", "open": base,
-            "close": base * (1 + wpct(_wfield("n1_cl"), 50)),
-            "high": base * (1 + wpct(_wfield("n1_hi"), 75)),
-            "low": base * (1 + wpct(_wfield("n1_lo"), 25)),
-            "vol": None}
-    tpred_bar = None
-    if live is not None:
-        tpred_bar = {"date": "T日预测", "open": o_today,
-                     "close": t_pred["cl"][50],
-                     "high": t_pred["hi"][50], "low": t_pred["lo"][50],
-                     "vol": None}
-    return t_pred, pred, clamped, tpred_bar
+            t_pred["hi"][pp]=round(max(t_pred["hi"][pp],live["high"]),2); t_pred["lo"][pp]=round(min(t_pred["lo"][pp],live["low"]),2)
+    pred={"date":"T日预测" if live is not None else ("今日(T)" if pre_open else "T+1预测"),"open":o_today,"close":t_pred["cl"][50],"high":t_pred["hi"][50],"low":t_pred["lo"][50],"vol":None,"confidence":confidence}
+    tpred_bar={"date":"T日预测","open":o_today,"close":t_pred["cl"][50],"high":t_pred["hi"][50],"low":t_pred["lo"][50],"vol":None,"confidence":confidence} if live is not None else None
+    return t_pred,pred,clamped,tpred_bar
+
+
+def _calculate_confidence(levels):
+    """计算预测置信度，基于多个维度评估样本质量。"""
+    if not CFG.CONFIDENCE_ENABLED:
+        return None
+    
+    confidence_score = 1.0
+    total_samples = sum(len(smp) for _, smp in levels)
+    
+    # 1. 样本数量因子
+    if total_samples < CFG.MIN_SAMPLES_REQUIRED:
+        confidence_score *= 0.5
+    elif total_samples < CFG.MIN_SAMPLES_REQUIRED * 2:
+        confidence_score *= 0.8
+    
+    # 2. 相似度一致性因子（所有样本的相似度分数方差）
+    if CFG.SIMILARITY_WEIGHTING and total_samples > 0:
+        all_scores = []
+        for _, smp in levels:
+            all_scores.extend([s.get("similarity_score", float('inf')) for s in smp])
+        
+        if len(all_scores) > 1:
+            mean_score = sum(all_scores) / len(all_scores)
+            variance = sum((s - mean_score) ** 2 for s in all_scores) / len(all_scores)
+            std_dev = variance ** 0.5
+            
+            # 相似度方差越小，置信度越高
+            consistency_factor = max(0.6, 1.0 - min(std_dev / 2.0, 0.4))
+            confidence_score *= consistency_factor
+    
+    # 3. 权重分布因子（有效权重占比）
+    if CFG.SIMILARITY_WEIGHTING and total_samples > 0:
+        all_weights = []
+        for _, smp in levels:
+            all_weights.extend([s.get("weight", 1.0) for s in smp])
+        
+        # 计算高权重样本占比（权重>1.0的样本）
+        high_weight_count = sum(1 for w in all_weights if w > 1.0)
+        weight_quality = high_weight_count / len(all_weights) if all_weights else 0.5
+        confidence_score *= (0.7 + 0.3 * weight_quality)  # 范围0.7-1.0
+    
+    # 4. 层级完整性因子（三个层级是否都有样本）
+    active_levels = sum(1 for _, smp in levels if smp)
+    if active_levels == 3:
+        confidence_score *= 1.0  # 完整的三级样本
+    elif active_levels == 2:
+        confidence_score *= 0.9  # 缺少一个层级
+    elif active_levels == 1:
+        confidence_score *= 0.7  # 只有一个层级
+    
+    # 归一化置信度分数到0-1范围
+    confidence_score = max(0.0, min(1.0, confidence_score))
+    
+    # 根据置信度分数返回等级
+    if confidence_score >= CFG.MEDIUM_CONFIDENCE_SCORE:
+        confidence_level = "高"
+    elif confidence_score >= CFG.LOW_CONFIDENCE_SCORE:
+        confidence_level = "中"
+    else:
+        confidence_level = "低"
+    
+    return {
+        "score": confidence_score,
+        "level": confidence_level,
+        "total_samples": total_samples,
+        "active_levels": active_levels,
+    }
 
 
 def _multi_day_prediction(o_today, levels, max_days=10):
     """多日预测：基于样本的统计分布，预测T+1到T+max_days的走势。
-    带均值回归修正：长期预测向零回归，减少累积误差。"""
-    tot_w = sum(LV_W[k] for k, _ in levels) or 1.0
-    
+    带均值回归修正：长期预测向零回归，减少累积误差。
+    使用动态三级权重 + 样本质量权重。"""
+    LW = _dynamic_lv_weights(levels)
+    tot_w = sum(LW.get(k, 0.0) for k, _ in levels) or 1.0
+
     def _wfield(field):
         pairs = []
         for k, smp in levels:
-            w = LV_W[k] / tot_w / len(smp)
-            pairs.extend((s[field], w) for s in smp if s.get(field) is not None)
+            lw = LW.get(k, 0.0) / tot_w
+            if CFG.SIMILARITY_WEIGHTING and smp:
+                tw = sum(s.get("weight", 1.0) for s in smp
+                         if s.get(field) is not None) or 1.0
+                for s in smp:
+                    if s.get(field) is not None:
+                        pairs.append((s[field], lw * s.get("weight", 1.0) / tw))
+            else:
+                w = lw / len(smp) if smp else 0
+                pairs.extend((s[field], w) for s in smp if s.get(field) is not None)
         return pairs
     
     PS = (10, 25, 50, 75, 90)
@@ -2161,12 +3412,19 @@ def _multi_day_prediction(o_today, levels, max_days=10):
         if not cl_pairs:
             break
         
+        # 区间校准：分位偏离P50放大 INTERVAL_K 倍
+        K = CFG.INTERVAL_K
+        c50 = wpct(cl_pairs, 50)
+        h50 = wpct(hi_pairs or cl_pairs, 50)
+        l50 = wpct(lo_pairs or cl_pairs, 50)
         day_pred = {
             "day": d,
             "label": f"T+{d}",
-            "cl": {p: wpct(cl_pairs, p) for p in PS},
-            "hi": {p: wpct(hi_pairs, p) if hi_pairs else wpct(cl_pairs, p) for p in PS},
-            "lo": {p: wpct(lo_pairs, p) if lo_pairs else wpct(cl_pairs, p) for p in PS},
+            "cl": {p: c50 + K * (wpct(cl_pairs, p) - c50) for p in PS},
+            "hi": {p: h50 + K * (wpct(hi_pairs or cl_pairs, p) - h50)
+                   for p in PS},
+            "lo": {p: l50 + K * (wpct(lo_pairs or cl_pairs, p) - l50)
+                   for p in PS},
             "up_prob": len([p for p, w in cl_pairs if p > 0]) / len(cl_pairs) if cl_pairs else 0.5,
         }
         
@@ -2251,8 +3509,10 @@ def analyze(full, progress=None, quick=False):
                 "high": max(q["high"], q["price"]),
                 "low": min(lo0, q["price"]), "vol": 0.0}
     had_today_bar = live is not None
-    if len(rows) < 100:
-        raise ValueError("上市时间太短，样本不足")
+    if len(rows) < 30:
+        raise ValueError(
+            f"该股上市不足30个交易日(现仅{len(rows)}根日K)，"
+            "暂无法统计预测，请过阵子再来")
 
     try:
         iq = f_iq.result()
@@ -2289,6 +3549,13 @@ def analyze(full, progress=None, quick=False):
     vr_now = vr_arr[-1]
     cur_regime = vol_regime(vr_now)
 
+    # 新股自适应：历史不足时缩短匹配窗口（最低5日）。
+    # 不重叠匹配要求窗口数 = len(rets) - 2W + 1，至少保留2个样本窗口
+    while W > 5 and len(rets) - 2 * W + 1 < 2:
+        W -= 1
+    if len(rets) - 2 * W + 1 < 1:
+        raise ValueError("历史K线过短，暂无法统计预测")
+
     def _dist_vol(i):
         vr_i = vr_arr[i]
         if vr_now is None or vr_i is None:
@@ -2308,19 +3575,32 @@ def analyze(full, progress=None, quick=False):
         return abs(sc - sec_chg_today)
 
     cur = znorm(rets[-W:])
+    # 今日侧多维特征（供 L1/L2/L3 匹配共用）
+    cur_ctx = _cur_context(rows, rets, vols_m, closes_m)
+    # 样本侧特征预计算（O(1)查表，避免逐日重复计算）
+    _l1_rsi = [rsi_at(closes_m, k) for k in range(len(closes_m))]
+    _l1_vola = [vola_at(rets, k) for k in range(len(rets))]
+    _l1_volchg = [volchg_at(vols_m, k) for k in range(len(vols_m))]
+    _l1_weekly = [weekly_ctx(rows, k, CFG.WEEKLY_N) for k in range(len(rows))]
+    _l1_struct = [candle_feats(rows, k) for k in range(len(rows))]
     sims = []
-    for i in range(W, len(rets) - 1):
-        w = znorm(rets[i - W:i])
-        d_px = sum((a - b) ** 2 for a, b in zip(cur, w)) ** 0.5
+    d_px_arr = _px_distances(rets, cur, W)   # numpy向量化（可用时）
+    for i in range(W, len(rets) - W + 1):
+        d_px = d_px_arr[i - W]
         d_v = _dist_vol(i)
         d_i = _dist_idx(i)
         d_s = _dist_sec(i)
+        d_x = _dist_extra(cur_ctx, {
+            "struct": _l1_struct[i], "vola": _l1_vola[i],
+            "rsi": _l1_rsi[i], "volchg": _l1_volchg[i],
+            "weekly": _l1_weekly[i]})
         score = (d_px
                  + (0.6 * min(d_v, 2.5) if d_v is not None else 0.30)
                  + (min(1.5, 0.3 * d_i) if d_i is not None else 0.40)
-                 + (min(1.2, 0.25 * d_s) if d_s is not None else 0.30))
+                 + (min(1.2, 0.25 * d_s) if d_s is not None else 0.30)
+                 + d_x)
         sims.append((score, i))
-    top = heapq.nsmallest(TOPK, sims, key=lambda x: x[0])
+    top = heapq.nsmallest(CFG.CANDIDATE_TOPK, sims, key=lambda x: x[0])
 
     prev_close = q["prev_close"] or closes_m[-1]
     # 盘前检测：快照日期已切到今日，但日K还没有今日bar → 尚未开盘，
@@ -2332,9 +3612,12 @@ def analyze(full, progress=None, quick=False):
     if pre_open:
         o_today = prev_close
         anchor = "昨收(未开盘)"
-    else:
+    elif live is not None:
         o_today = q["open"] or prev_close
         anchor = "今开"
+    else:
+        o_today = prev_close
+        anchor = "今收"
     gap_today = (o_today / prev_close - 1) * 100
 
     # 市场阶段（按行情快照时间）
@@ -2343,7 +3626,7 @@ def analyze(full, progress=None, quick=False):
 
     samples = []
     max_pred_days = 10  # 最多预测10天
-    for _, i in top:
+    for score, i in top:
         r = rows[i]
         ic = idx_chg_by_date.get(r["date"])
         sc = sec_chg_by_date.get(r["date"])
@@ -2357,21 +3640,39 @@ def analyze(full, progress=None, quick=False):
                       if (sc is not None and sec_chg_today is not None)
                       else None),
             "gap": rows[i + 1]["open"] / r["close"] - 1 if i + 1 < len(rows) else None,
-        }
+            "similarity_score": score,
+            "weight": (math.exp(-min(max(0.0, score - top[0][0]), 6.0) / 0.9)
+                       if CFG.SIMILARITY_WEIGHTING else 1.0),
+            "_match_i": i,        }
+        # 时间衰减（L1样本；与_pool_match同款，消融回测证实有益）
+        if CFG.TIME_DECAY_ENABLED:
+            try:
+                age = (time.mktime(time.strptime(
+                    time.strftime("%Y-%m-%d"), "%Y-%m-%d"))
+                    - time.mktime(time.strptime(r["date"], "%Y-%m-%d"))) / 86400.0
+                if age > CFG.TIME_DECAY_DAYS:
+                    sample["weight"] *= max(
+                        CFG.TIME_DECAY_RATE,
+                        1.0 - (age - CFG.TIME_DECAY_DAYS) / 365.0 * 0.5)
+            except (ValueError, TypeError):
+                pass
         # 扩展样本：记录T+1到T+max_pred_days的相对前日收盘涨跌幅
+        # 与 Open→Close/High/Low（盘中预测用，逻辑与今开锚定一致）
         for d in range(1, max_pred_days + 1):
             if i + d < len(rows):
                 nd = rows[i + d]
                 prev_c = rows[i + d - 1]["close"] if i + d - 1 >= 0 else r["close"]
+                op = nd.get("open") or prev_c
                 sample[f"n{d}_date"] = nd["date"]
                 sample[f"n{d}_cl"] = nd["close"] / prev_c - 1
                 sample[f"n{d}_hi"] = nd["high"] / prev_c - 1
                 sample[f"n{d}_lo"] = nd["low"] / prev_c - 1
+                sample[f"n{d}_oc"] = nd["close"] / op - 1 if op > 0 else None
+                sample[f"n{d}_oh"] = nd["high"] / op - 1 if op > 0 else None
+                sample[f"n{d}_ol"] = nd["low"] / op - 1 if op > 0 else None
             else:
-                sample[f"n{d}_date"] = None
-                sample[f"n{d}_cl"] = None
-                sample[f"n{d}_hi"] = None
-                sample[f"n{d}_lo"] = None
+                for suf in ("date", "cl", "hi", "lo", "oc", "oh", "ol"):
+                    sample[f"n{d}_{suf}"] = None
         samples.append(sample)
     # 样本分层筛选：① 量能状态+大盘涨跌接近 ② 开盘缺口接近 ③ 全部
     for s in samples:
@@ -2389,17 +3690,45 @@ def analyze(full, progress=None, quick=False):
         src, filter_note = sel_gap, "按开盘缺口筛选"
     else:
         src, filter_note = samples, "使用全部样本"
+    # 去重挑选：间隔 W//2 → 不足则分级放宽(3/1)，避免样本被砍光
+    src_sorted = sorted(src, key=lambda x: x.get("similarity_score", 9.0))
+    picked = []
 
-    # ---- 二三级样本池：L2 同行业 / L3 同市值层 ----
+    def _pick(gap):
+        pl, used = [], []
+        for s in src_sorted:
+            ii = s.get("_match_i")
+            if ii is not None and any(abs(ii - j) < gap for j in used):
+                continue
+            pl.append(s)
+            if ii is not None:
+                used.append(ii)
+            if len(pl) >= TOPK:
+                break
+        return pl
+
+    for gap in (max(3, W // 2), 3, 1):
+        picked = _pick(gap)
+        if len(picked) >= min(TOPK, 6):
+            break
+    if picked:
+        src = picked
+
+    # ---- 二三级样本池：L2 同行业(传统行业+ETF) / L3 已删 ----
+    # 题材行业/ETF 只用 L1（交易回测：题材L2无增益，ETF L2劣于持有）
     level_map = {}
     pool_note = ""
-    if CACHE_OK and pool_info:
+    my_info = get_stock_info(full) or {}
+    solo_l1 = _is_etf(full) or _is_theme_industry(my_info.get("industry"))
+    if solo_l1:
+        pool_note = "样本池: 题材/ETF仅L1"
+    elif CACHE_OK and pool_info:
         try:
             if progress:
                 progress("拉取同行/同市值层K线(首次回填较慢)...")
             level_map = _load_pools(pool_info, cur, vr_now,
                                     idx_chg_by_date, idx_chg_today,
-                                    progress)
+                                    progress, cur_ctx=cur_ctx)
             parts = [f"{LV_LABEL['L1']}{len(src)}"]
             parts += [f"{LV_LABEL[k]}{len(v)}"
                       for k, v in sorted(level_map.items()) if v]
@@ -2426,12 +3755,32 @@ def analyze(full, progress=None, quick=False):
     pdi_a, mdi_a, adx_a = calc_adx(disp_rows)
     mas = {n: sma_period(closes_i, n) for n in MA_COLORS}
 
+    # ---- 所选策略（meta缓存，5日过期；无缓存用默认多维·稳健）----
+    strat = load_strategy(full)
+    rp = dict(strat["params"]) if (strat and strat.get("params")) \
+        else CFG.risk_params()
+    sel_algo = (strat or {}).get("algo", "composite")
+    if sel_algo not in ALGO_LABEL:
+        sel_algo = "composite"
+
     signals = []
+    # ---- 指标型策略：直接按该算法规则生成历史买卖点（近250根，同策略）----
+    if sel_algo in ("macd", "kdj", "rsi", "boll", "ma_trend", "l1_pattern"):
+        try:
+            raw = {"macd": _sig_macd, "kdj": _sig_kdj, "rsi": _sig_rsi,
+                   "boll": _sig_boll, "ma_trend": _sig_ma_trend,
+                   "l1_pattern": _sig_l1_pattern}[sel_algo](disp_rows)
+            cut = max(1, len(disp_rows) - 250)
+            signals = [s for s in raw if s[0] >= cut]
+        except Exception:
+            log.exception("策略%s信号生成失败(回退多维评分)", sel_algo)
+            sel_algo = "composite"
     # ---- 多维打分：每日综合评分，方向切换时生成买卖信号 ----
     # 评分维度：MACD趋势、KDJ状态、RSI超买超卖、量价配合、MA20趋势、
     #          筹码位置、统计偏多/偏空；合计≥2→多头信号，≤-2→空头信号
     _bull_scores = []   # (index, date, score, reasons)
-    start = max(1, len(disp_rows) - 120)
+    start = max(1, len(disp_rows) - 120) if sel_algo == "composite" \
+        else len(disp_rows)      # 指标型策略跳过多维打分循环
     vols_d = [r.get("vol") or 0.0 for r in disp_rows]
     try:
         chip_snaps = chip_snapshots(disp_rows, tail=120)
@@ -2553,9 +3902,8 @@ def analyze(full, progress=None, quick=False):
             cooldown -= 1
             continue
 
-        # 弱势行情过滤：当日大盘/板块弱势时，BUY需要更高分，SELL保持阈值
-        buy_threshold = (CFG.SIGNAL_SCORE_BUY + 1) if _weak_day(day) \
-            else CFG.SIGNAL_SCORE_BUY
+        # 弱势行情过滤：当日大盘弱势时 BUY 加严；买入阈值/冷却按所选策略
+        buy_threshold = (rp["buy_th"] + 1) if _weak_day(day) else rp["buy_th"]
         sell_threshold = CFG.SIGNAL_SCORE_SELL
 
         if sc >= buy_threshold and prev_dir <= 0:
@@ -2565,7 +3913,7 @@ def analyze(full, progress=None, quick=False):
                 reason_str += " [弱势谨慎]"
             signals.append((idx_i, day, "BUY", reason_str))
             prev_dir = 1
-            cooldown = CFG.SIGNAL_COOLDOWN
+            cooldown = rp["cooldown"]
         elif sc <= sell_threshold and prev_dir >= 0:
             bear_r = [r for r in reasons if r not in _bull_words]
             signals.append((idx_i, day, "SELL",
@@ -2573,16 +3921,23 @@ def analyze(full, progress=None, quick=False):
             prev_dir = -1
             cooldown = CFG.SIGNAL_COOLDOWN
 
-    # ---- 波段适合度路由：适合波段用现有多维/形态算法；不适合用长周期趋势跟踪 ----
+    # ---- 波段适合度路由：仅多维评分策略时替换信号；指标型策略尊重用户选择 ----
     band_score = _band_fit_score(disp_rows, mas, vr_arr)
     band_fit = band_score >= CFG.BAND_FIT_MIN
-    if band_fit:
+    if sel_algo != "composite":
+        band_algo = f"策略·{ALGO_LABEL.get(sel_algo, sel_algo)}"
+    elif band_fit:
         band_algo = "波段·多维融合"
     else:
         # 不适合波段：改用长周期 MA20/MA60 趋势跟踪，信号少而稳
-        signals = _trend_track_signals(disp_rows, mas,
-                                       idx_chg_by_date, idx_chg_today)
-        band_algo = "趋势跟踪·MA20/60"
+        t_signals = _trend_track_signals(disp_rows, mas,
+                                         idx_chg_by_date, idx_chg_today)
+        if t_signals:
+            signals = t_signals
+            band_algo = "趋势跟踪·MA20/60"
+        else:
+            # 趋势跟踪零信号（震荡股无MA金叉）→ 回退多维信号，避免无买卖点
+            band_algo = "趋势跟踪·MA20/60（无信号→回退多维）"
     band_note = f"波段适合度 {band_score:.0f}/100 → {band_algo}"
 
     vols = [r["vol"] for r in disp_rows]
@@ -2727,26 +4082,60 @@ def analyze(full, progress=None, quick=False):
     except Exception:
         log.exception("综合评估计算失败(action=None)")
 
-    # ---- 回测统计：基于全部历史信号计算胜率/盈亏/年化 ----
+    # ---- 回测统计：基于全部历史信号计算胜率/盈亏/年化（按所选策略参数）----
     bt_stats = None
     if signals and len(signals) >= 2:
         try:
-            bt_stats = backtest_signals(disp_rows, signals)
+            bt_stats = backtest_signals(disp_rows, signals, rp=rp)
         except Exception:
             log.exception("回测统计失败(bt_stats=None)")
-    
+
+    # ---- 幽灵K线：T+1 / T+5 / T+10（白色虚线边框，随所选策略融合预测）----
+    def _ghost(day_pred, label):
+        if not day_pred:
+            return None
+        o = o_today
+        if label != "T+1" and multi_pred:
+            idx = int(label[2:]) - 2
+            if 0 <= idx < len(multi_pred):
+                o = multi_pred[idx]["price_cl"]      # 前一预测日收盘为开
+        hi = day_pred.get("price_hi") or day_pred["close"]
+        lo = day_pred.get("price_lo") or day_pred["close"]
+        cl = day_pred.get("price_cl") or day_pred["close"]
+        hi = max(hi, o, cl)
+        lo = min(lo, o, cl)
+        return {"date": f"{label}预测", "open": round(o, 2),
+                "close": round(cl, 2), "high": round(hi, 2),
+                "low": round(lo, 2), "vol": None}
+    # T+1 已由 pred 承担（slice_view 追加），幽灵只补 T+5 / T+10
+    ghosts = []
+    for dd in (5, 10):
+        if multi_pred and len(multi_pred) >= dd:
+            g = _ghost(multi_pred[dd - 1], f"T+{dd}")
+            if g:
+                ghosts.append(g)
+
     return {
         "quote": q, "full_code": full, "disp_rows": disp_rows,
         "anchor": anchor, "pre_open": pre_open,
         "phase": phase, "next_label": next_label,
         "tpred_bar": tpred_bar,
+        "t5_pred": t_pred.get("t5"),
         "pred": pred, "t_pred": t_pred, "multi_pred": multi_pred,
+        "ghosts": ghosts,
+        "strategy": strat,
+        "risk_mode": (strat or {}).get("mode",
+                                       CFG.RISK_MODE if sel_algo == "composite"
+                                       else "稳健"),
+        "sel_algo": sel_algo,
         "samples": samples, "src_n": len(src),
         "filtered": src is not samples,
         "filter_note": filter_note,
         "levels": [{"key": k, "label": LV_LABEL[k], "n": len(smp),
-                    "up_prob": len([s for s in smp if s.get("n1_cl") is not None and s["n1_cl"] > 0])
-                    / len(smp)} for k, smp in levels],
+                    "samples": smp,
+                    "up_prob": (len([s for s in smp if s.get("n1_cl") is not None and s["n1_cl"] > 0])
+                                / len(smp)) if smp else 0.5}
+                   for k, smp in levels],
         "pool_note": pool_note,
         "idx_chg_today": idx_chg_today, "vr_now": vr_now,
         "cur_regime": cur_regime,
@@ -2770,6 +4159,7 @@ def analyze(full, progress=None, quick=False):
         "_ctx": {
             "full": full, "o_today": o_today, "pre_open": pre_open,
             "live": live, "src": src, "cur": cur,
+            "cur_ctx": cur_ctx,
             "vr_now": vr_now, "idx_chg_by_date": idx_chg_by_date,
             "idx_chg_today": idx_chg_today, "gap_today": gap_today,
             "prev_close": prev_close, "pool_info": pool_info,
@@ -2789,10 +4179,13 @@ def slice_view(res, show_n, pan=0):
         vis_chips = calc_chips(vis, vis[-1]["close"]) if vis else None
     except Exception:
         vis_chips = None
+    # 幽灵K线追加：T+1预测 + T+5/T+10（白色虚线边框）
+    ghosts = [g for g in (res.get("ghosts") or []) if g]
     view = {
-        "bars": vis + [res["pred"]],
+        "bars": vis + [res["pred"]] + ghosts,
         "dates": ([r["date"] for r in vis]
-                  + ["T+1" if pd.startswith("T+") else "T日"]),
+                  + ["T+1" if pd.startswith("T+") else "T日"]
+                  + [g["date"] for g in ghosts]),
         "off": off,
         "tpred": res.get("tpred_bar"),
         "chips": vis_chips or res.get("chips"),
@@ -2808,10 +4201,11 @@ def slice_view(res, show_n, pan=0):
         "boll_mid": res["ind"]["boll_mid"][off:end],
         "boll_up": res["ind"]["boll_up"][off:end],
         "boll_low": res["ind"]["boll_low"][off:end], "pdi": res["ind"]["pdi"][off:end], "mdi": res["ind"]["mdi"][off:end], "adx": res["ind"]["adx"][off:end],
-        "vols": res["vols"][off:end] + [None],
+        "vols": res["vols"][off:end] + [None] * (1 + len(ghosts)),
         "signals": [(i - off, dt, t, txt) for i, dt, t, txt in res["signals"]
                     if off <= i < end],
     }
+    view["ghost_n"] = len(ghosts)
     return view
 
 
@@ -2960,6 +4354,8 @@ class App:
         self.ma_on = {nn: tk.BooleanVar(value=True) for nn in MA_COLORS}
 
         self._build_toolbar()
+        # 注册AI找源确认钩子：数据源全灭时弹窗询问（主线程弹窗，后台执行）
+        globals()["_AI_RESCUE_HOOK"] = self._ai_rescue_flow
         if getattr(self, "_last_code", ""):
             self.code_var.set(self._last_code)
         self._build_body()
@@ -3054,6 +4450,8 @@ class App:
             ttk.Button(top2, text="工具", width=4,
                        command=lambda: self._tools_menu(top2)
                        ).pack(side="right", padx=2)
+            ttk.Button(top2, text="荐股", width=4,
+                       command=self._open_picks).pack(side="right", padx=2)
         else:
             ttk.Separator(top, orient="vertical").pack(side="left", fill="y",
                                                        padx=8)
@@ -3087,6 +4485,8 @@ class App:
                            selectcolor=FIELD_BG).pack(side="left")
             ttk.Separator(top, orient="vertical").pack(side="left", fill="y",
                                                        padx=8)
+            ttk.Button(top, text="每日荐股", command=self._open_picks
+                       ).pack(side="left", padx=2)
             ttk.Button(top, text="复制报告",
                        command=self.copy_report).pack(side="left", padx=2)
             ttk.Button(top, text="导出报告",
@@ -3122,22 +4522,29 @@ class App:
         # 窗口缩放 / 文本更新时压缩股票信息文本，避免溢出
         self._info_lbl = info_lbl
         self._info_row = info_row
+        # 状态栏（进度）同样截断：小屏上长文本会溢出
+        self._prog_lbl = progress_lbl
 
         def _fit_info(_e=None):
             try:
                 avail = info_row.winfo_width() - 120
-                text = self.info_var.get()
                 if avail > 10:
                     est = max(6, int(avail / 9))
-                    if len(text) > est:
-                        info_lbl.config(text=text[:est] + "…")
-                    else:
-                        info_lbl.config(text=text)
+                    # 股票信息
+                    text = self.info_var.get()
+                    info_lbl.config(text=text[:est] + "…" if len(text) > est
+                                    else text)
+                    # 进度文本：给右侧hover留空间
+                    ptext = self.progress_var.get()
+                    pest = max(6, est - 10)
+                    self._prog_lbl.config(
+                        text=ptext[:pest] + "…" if len(ptext) > pest else ptext)
             except Exception:
                 pass
         info_row.bind("<Configure>", _fit_info)
         # 变量变化时也重新适配
         self.info_var.trace_add("write", lambda *a: self._fit_info())
+        self.progress_var.trace_add("write", lambda *a: self._fit_info())
         self._fit_info = _fit_info
         self._fit_info()
 
@@ -3146,9 +4553,11 @@ class App:
         body.pack(fill="both", expand=True)
 
         # ---- 右侧：预测参考（先pack，防止遮挡图表；小屏省略）----
+        right = None
         if not self.compact:
             right = ttk.LabelFrame(body, text=" 预测参考 ", padding=4)
             right.pack(side="right", fill="y", padx=(2, 8), pady=6)
+            self._w_right = right
 
             rt = tk.Frame(right, bg=DARK_BG)
             rt.pack(fill="x")
@@ -3167,6 +4576,7 @@ class App:
                                     insertbackground=FG_MAIN,
                                     selectbackground="#2b3540")
             self.side_txt.pack(fill="both", expand=True)
+        self._w_right = getattr(self, "_w_right", None)
 
         # ---- 左侧：自选池（固定宽度；小屏省略）----
         if not self.compact:
@@ -3204,6 +4614,7 @@ class App:
         # ---- 中部：图表 + 指数条 ----
         left = tk.Frame(body)
         left.pack(side="left", fill="both", expand=True)
+        self._w_left = left
         self.cv_main = Chart(left, self.PANEL_H["main"])
         self.cv_vol = Chart(left, self.PANEL_H["vol"])
         self.cv_ind = Chart(left, self.PANEL_H["ind"])
@@ -3238,9 +4649,11 @@ class App:
         idxbar.columnconfigure(len(INDEX_CODES), weight=0)
         if getattr(self, "compact", False):
             idxbar.grid_remove()
+        self._w_idxbar = idxbar
 
         bottom = tk.Frame(self.root, bg=DARK_BG)
         bottom.pack(fill="both", padx=8, pady=(2, 6))
+        self._w_bottom = bottom
         self.txt = tk.Text(bottom, height=5 if self.compact else 8,
                            font=("Consolas", 9),
                            bg="#12171d", fg="#cfd8e0",
@@ -3264,7 +4677,60 @@ class App:
             cv.bind("<ButtonPress-1>", self._drag_start)
             cv.bind("<B1-Motion>", self._drag_move)
             cv.bind("<ButtonRelease-1>", self._drag_end)
+            cv.bind("<Double-Button-1>", self._drag_reset)
     # ---------- 折叠 ----------
+
+    def _open_picks(self):
+        """每日荐股：扫本地缓存多维打分，Top-N 入围。"""
+        win = tk.Toplevel(self.root)
+        win.title(f"每日荐股 · 风险偏好{CFG.RISK_MODE} · 纯本地缓存")
+        win.configure(bg=DARK_BG)
+        win.geometry("520x460" if not self.compact else
+                     f"{self.root.winfo_screenwidth()}x"
+                     f"{self.root.winfo_screenheight()}+0+0")
+        if self.compact:
+            win.attributes("-fullscreen", True)
+            win.bind("<Escape>", lambda e: win.destroy())
+        lb = tk.Listbox(win, font=("Consolas", 9), bg="#12171d",
+                        fg="#cfd8e0", selectbackground="#2b3540")
+        lb.pack(fill="both", expand=True, padx=6, pady=6)
+        lb.insert("end", "扫描本地缓存中…")
+
+        def worker():
+            try:
+                picks = daily_picks(progress=lambda s: self._safe_after(
+                    0, lambda: self.progress_var.set(s)))
+            except Exception as e:
+                picks = []
+                self._safe_after(0, lambda: lb.delete(0, "end") or
+                                 lb.insert("end", f"失败: {e}"))
+            self._safe_after(0, lambda: self._picks_fill(win, lb, picks))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _picks_fill(self, win, lb, picks):
+        lb.delete(0, "end")
+        if not picks:
+            lb.insert("end", "今日缓存中无入围股票（无买入阈值以上评分）")
+            return
+        lb.insert("end", f"{'代码':<10}{'名称':<8}{'收盘':>8}{'涨跌':>7}"
+                         f"{'评分':>5}  理由")
+        self._picks_codes = []
+        for code, name, close, chg, score, reasons, band in picks:
+            lb.insert("end", f"{code:<10}{name[:6]:<8}{close:>8.2f}"
+                             f"{chg:>+6.1f}%{score:>4}  {reasons[:30]}"
+                             f"  波段{band:.0f}")
+            self._picks_codes.append(code)
+        lb.insert("end", "")
+        lb.insert("end", "双击某行 → 直接分析该股")
+
+        def pick(_e=None):
+            sel = lb.curselection()
+            if sel and sel[0] < len(self._picks_codes):
+                code = self._picks_codes[sel[0]]
+                win.destroy()
+                self.code_var.set(code)
+                self.run()
+        lb.bind("<Double-Button-1>", pick)
 
     def _open_idx_window(self):
         """小屏：五大指数弹窗（打开期间由 _index_loop 每30秒自动刷新）。"""
@@ -3397,6 +4863,42 @@ class App:
         self._run_bg(lambda: analyze(full, self._progress, quick=True),
                      self._done_load)
 
+    # ---------- AI 找源：确认弹窗 → 后台验证 → 自动重新分析 ----------
+
+    def _ai_rescue_flow(self):
+        """数据源全灭时由后台线程调用；转到主线程弹确认框。"""
+        def ask():
+            if not self.api_key:
+                self.progress_var.set(
+                    "所有K线源失效；在设置里配好DeepSeek Key后可AI自动找源")
+                return
+            yes = messagebox.askyesno(
+                "数据源急救",
+                "所有K线数据源均失效，自动容灾也未能恢复。\n\n"
+                "是否让 AI(DeepSeek) 寻找替代接口？\n\n"
+                "· AI 只提议候选URL，程序会逐个实测验证\n"
+                "· 验证通过才会启用并记住，失败全部丢弃\n"
+                "· 成功后将自动重新分析当前股票")
+            if not yes:
+                self.progress_var.set("已跳过AI找源；可稍后运行 "
+                                      "python stock_firstaid.py --ai")
+                return
+            self.progress_var.set("AI正在寻找新数据源（提议→实测验证）...")
+            key, model = self.api_key, AI_MODEL
+
+            def work():
+                ok, msg = ai_rescue_kline(key, model)
+                self._safe_after(0, lambda: self._ai_rescue_done(ok, msg))
+            threading.Thread(target=work, daemon=True).start()
+        self._safe_after(0, ask)
+
+    def _ai_rescue_done(self, ok, msg):
+        self.progress_var.set("AI找源: " + msg)
+        if ok:
+            # 新源已生效，自动重新分析当前股票
+            if self.code_var.get().strip():
+                self.run()
+
     def _done_load(self, res, err):
         if err:
             self._fail(str(err))
@@ -3405,6 +4907,8 @@ class App:
         if res.get("quick"):
             # 启动后后台逐步加载样本池，边加载边更新预测K线（不阻塞界面）
             self._start_progressive(res)
+            # 策略缓存过期/缺失 → 后台消融回测 + 弹窗三选一
+            self._ensure_strategy(res)
 
     def _start_progressive(self, res):
         ctx = res.get("_ctx")
@@ -3440,12 +4944,130 @@ class App:
         res["tpred_bar"] = tpred_bar
         res["pool_note"] = pool_note
         res["multi_pred"] = multi_pred
+        res["t5_pred"] = t_pred.get("t5")
         res["levels"] = [
             {"key": k, "label": LV_LABEL[k], "n": len(smp),
-             "up_prob": len([s for s in smp if s.get("n1_cl") is not None and s["n1_cl"] > 0]) / len(smp)}
+             "samples": smp,
+             "up_prob": (len([s for s in smp if s.get("n1_cl") is not None and s["n1_cl"] > 0]) / len(smp)) if smp else 0.5}
             for k, smp in sorted(level_map.items()) if smp]
         self._rerender()
         self.progress_var.set("样本池加载中，预测已更新: " + pool_note)
+
+    # ---------- 策略消融：后台回测 → 弹窗选三档策略（缓存5日） ----------
+
+    def _ensure_strategy(self, res):
+        """无有效策略缓存时后台跑消融，完成后弹窗让用户三选一。"""
+        if self.res is not res:
+            return
+        if res.get("strategy"):
+            st = res["strategy"]
+            self.progress_var.set(
+                f"当前策略: {st.get('label', '?')} "
+                f"(策略缓存{5 - (time.time() - st.get('ts', 0)) // 86400:.0f}日内有效)")
+            return
+        self.progress_var.set("后台运行多算法消融回测(L1/MACD/KDJ/RSI/布林/"
+                              "MA/多维×3风险档, 近1000交易日)...")
+        full = res["full_code"]
+        bars = res["disp_rows"][:-1] if res.get("has_live") \
+            else res["disp_rows"]
+        try:
+            idx_rows = get_daily("sh000001")
+        except Exception:
+            idx_rows = None
+
+        def work():
+            return run_ablation(full, bars, idx_rows=idx_rows,
+                                progress=self._progress)
+
+        self._run_bg(work, lambda r, e: self._ablation_done(res, r, e))
+
+    def _ablation_done(self, res, abl, err):
+        if self.res is not res:
+            return                  # 已切换股票，丢弃
+        if err or not abl:
+            self.progress_var.set("策略消融未完成"
+                                  + (f": {err}" if err else "（历史过短）")
+                                  + "，使用默认多维·稳健")
+            return
+        self._last_ablation = abl
+        self._show_strategy_popup(res, abl)
+
+    def _show_strategy_popup(self, res, abl):
+        full = res["full_code"]
+        win = tk.Toplevel(self.root)
+        win.title(f"策略消融选择 - {full}")
+        win.configure(bg=DARK_BG)
+        win.transient(self.root)
+        win.grab_set()
+        ttk.Label(win, text=(
+            f"基于近{abl['bars']}个交易日回测选策略 "
+            f"（训练{abl['train_n']}日选型 / 验证{abl['val_n']}日防过拟合，"
+            f"验证集未参与选择）\n"
+            f"牛熊分界：上证指数收盘 vs MA120。以下胜率/年化/回撤为"
+            f"【验证集】样本外数据，牛/熊评分为对应行情段的年化收益。")
+                  ).pack(anchor="w", padx=12, pady=(10, 4))
+        box = ttk.Frame(win)
+        box.pack(fill="both", expand=True, padx=12, pady=4)
+        sel_var = tk.StringVar(value="稳健")
+        order = ("保守", "稳健", "激进")
+
+        def _fmt(v, pct=True):
+            if v is None:
+                return "-"
+            return f"{v * 100:+.1f}%" if pct else f"{v:.2f}"
+
+        for i, mode in enumerate(order):
+            c = abl["mode_candidates"].get(mode)
+            if not c:
+                continue
+            tr, va = c.get("train") or {}, c.get("val") or {}
+            txt = (f"{mode}｜{c['label']}\n"
+                   f"  验证期: 胜率{_fmt(va.get('winrate'))} "
+                   f"年化{_fmt(va.get('ann'))} 回撤{_fmt(va.get('mdd'))} "
+                   f"交易{va.get('trades', 0)}笔"
+                   f"（训练期: 胜率{_fmt(tr.get('winrate'))} "
+                   f"年化{_fmt(tr.get('ann'))} 回撤{_fmt(tr.get('mdd'))}）\n"
+                   f"  牛市评分{_fmt(c.get('bull'))}  "
+                   f"熊市评分{_fmt(c.get('bear'))}")
+            rb = ttk.Radiobutton(box, text=txt, value=mode,
+                                 variable=sel_var)
+            rb.pack(anchor="w", pady=4)
+
+        def apply():
+            c = abl["mode_candidates"].get(sel_var.get())
+            if not c:
+                return
+            save_strategy(full, {"algo": c["algo"], "mode": c["mode"],
+                                 "params": c["params"], "label": c["label"],
+                                 "ts": time.time()})
+            win.destroy()
+            self.progress_var.set(
+                f"已选策略: {c['label']}（缓存5日，到期自动重新消融）")
+            try:
+                full2 = normalize_code(self.code_var.get())
+                self._run_bg(lambda: analyze(full2), self._refresh_done)
+            except ValueError:
+                pass
+
+        btns = ttk.Frame(win)
+        btns.pack(pady=10)
+        ttk.Button(btns, text="应用所选策略", command=apply).pack(
+            side="left", padx=6)
+        ttk.Button(btns, text="本次先用默认(多维·稳健)",
+                   command=win.destroy).pack(side="left", padx=6)
+
+    def _rerun_strategy(self):
+        """手动重选：清除策略缓存并重新消融（工具菜单入口）。"""
+        if not self.res:
+            messagebox.showinfo("提示", "请先【分析预测】一只股票")
+            return
+        try:
+            with db_conn(commit=True) as conn:
+                conn.execute("DELETE FROM meta WHERE key=?",
+                             (_strat_key(self.res["full_code"]),))
+        except Exception:
+            log.exception("清除策略缓存失败")
+        self._ensure_strategy(self.res)
 
     def _auto_refresh(self):
         """每15分钟静默重跑当前代码分析，刷新当日实时K线与预测。"""
@@ -3489,7 +5111,7 @@ class App:
             live = res["disp_rows"][-1]
             live["close"] = q["price"]
             live["high"] = max(live["high"], q["price"])
-            live["low"] = min(live["low"], q["price"]) if q["low"] > 0 else live["low"]
+            live["low"] = min(live["low"], q["price"]) if q.get("low") and q["low"] > 0 else live["low"]
             tp = res["t_pred"]
             for pp in (10, 25, 50, 75, 90):     # 预测区间并入最新高低
                 tp["hi"][pp] = round(max(tp["hi"][pp], live["high"]), 2)
@@ -3614,11 +5236,15 @@ class App:
     def _drag_start(self, event):
         self._drag_x = event.x
         self._drag_pan = self.view_pan
+        self._drag_moved = False
 
     def _drag_move(self, event):
-        if not self.res or not hasattr(self, "_drag_x"):
+        if not self.res or not hasattr(self, "_drag_x") \
+                or self._drag_x is None:
             return
         dx = event.x - self._drag_x
+        if abs(dx) > 4:
+            self._drag_moved = True   # 拖动中抑制十字光标重绘
         g = self.scales.get("main")
         if not g or g.get("bw", 0) <= 0:
             return
@@ -3627,9 +5253,9 @@ class App:
                              len(self.res["disp_rows"]) - 20))
         if new_pan != self.view_pan:
             self.view_pan = new_pan
-            # 拖拽节流：拖动中只保证 ~30ms 一次重绘，小屏触摸更跟手不卡顿
+            # 拖拽节流：armv6 小屏 60ms 一次重绘，跟手不卡
             if not getattr(self, "_drag_job", None):
-                self._drag_job = self.root.after(30, self._rerender)
+                self._drag_job = self.root.after(60, self._rerender)
 
     def _drag_end(self, event):
         self._drag_x = None
@@ -3637,6 +5263,13 @@ class App:
         if getattr(self, "_drag_job", None):
             self.root.after_cancel(self._drag_job)
             self._drag_job = None
+            self._rerender()
+
+    def _drag_reset(self, _event):
+        """双击图表：回到最新K线（清除平移）。"""
+        if self.view_pan:
+            self.view_pan = 0
+            self.progress_var.set("已回到最新")
             self._rerender()
 
     # ---------- 绘图工具 ----------
@@ -3721,6 +5354,9 @@ class App:
         bars = v["bars"]
         has_chips = self.show_chips.get() and v.get("chips") and v["chips"].get("bins")
         g = self._geom(cv, len(bars), chips=has_chips)
+        if not bars:
+            return
+
         los = [b["low"] for b in bars]
         his = [b["high"] for b in bars]
         for nn, on in self.ma_on.items():
@@ -3741,6 +5377,8 @@ class App:
                 if vals:
                     los.append(min(vals))
                     his.append(max(vals))
+        if not los or not his:
+            return
         lo, hi = self._pad_range(min(los), max(his))
 
         def ymap(val):
@@ -3796,36 +5434,37 @@ class App:
                                    font=("Microsoft YaHei", 8))
 
         yo = yc = None
+        ghost_lab = {"T+1预测": "T+1", "T日预测": "T日",
+                     "T+5预测": "T+5", "T+10预测": "T+10"}
         for i, b in enumerate(bars):
             x = xs(i)
-            isp = b["date"] in ("T+1预测", "T日预测")
+            if b["date"] in ghost_lab:
+                # 幽灵K线：预测蜡烛，白色虚线边框（亮色主题自动转黑）
+                yo, yc = ymap(b["open"]), ymap(b["close"])
+                bw2 = max(g["bw"] * 0.62, 2)
+                ty, by2 = min(yo, yc), max(yo, yc)
+                if by2 - ty < 1.5:
+                    by2 = ty + 1.5
+                cv.create_line(x, ymap(b["high"]), x, ty,
+                               fill=TPRED_C, dash=(3, 2))
+                cv.create_line(x, by2, x, ymap(b["low"]),
+                               fill=TPRED_C, dash=(3, 2))
+                cv.create_rectangle(x - bw2 / 2, ty, x + bw2 / 2, by2,
+                                    fill="", outline=TPRED_C, dash=(4, 3))
+                cv.create_text(x, ty - 9, text=ghost_lab[b["date"]],
+                               fill=TPRED_C, font=("Consolas", 7, "bold"))
+                continue
             up = b["close"] >= b["open"]
-            color = PRED_C if isp else (UP if up else DOWN)
-            dash = (3, 2) if isp else ()
+            color = UP if up else DOWN
             yo, yc = ymap(b["open"]), ymap(b["close"])
             cv.create_line(x, ymap(b["high"]), x, ymap(b["low"]),
-                           fill=color, dash=dash)
+                           fill=color)
             bw2 = max(g["bw"] * 0.62, 2)
             ty, by2 = min(yo, yc), max(yo, yc)
             if by2 - ty < 1:
                 by2 = ty + 1
             cv.create_rectangle(x - bw2 / 2, ty, x + bw2 / 2, by2,
-                                fill="" if isp else color,
-                                outline=color, dash=dash)
-
-        # 当日预测：白色虚线幽灵K线叠加在实时bar同一位置
-        tpred = v.get("tpred")
-        if tpred:
-            li = len(v["bars"]) - 2      # 实时bar在视图中的下标
-            x = xs(li)
-            cv.create_line(x, ymap(tpred["high"]), x, ymap(tpred["low"]),
-                           fill=TPRED_C, dash=(3, 2))
-            y1 = ymap(max(tpred["open"], tpred["close"]))
-            y2 = ymap(min(tpred["open"], tpred["close"]))
-            bw3 = max(g["bw"] * 0.62, 2) + 3   # 略宽于实体，形成外框
-            cv.create_rectangle(x - bw3 / 2, y1, x + bw3 / 2,
-                                max(y2, y1 + 1),
-                                fill="", outline=TPRED_C, dash=(3, 2))
+                                fill=color, outline=color)
 
         for i, day, typ, txt in v["signals"]:
             if i >= len(bars) - 1:
@@ -3844,17 +5483,29 @@ class App:
                 cv.create_text(x, y - 15, text="S", fill=DOWN,
                                font=("Arial", 8, "bold"))
 
-        pb = bars[-1]
-        if len(bars) >= 2 and bars[-2]["date"] == "T日预测":
-            tb = bars[-2]
-            cv.create_text(xs(len(bars) - 1) - 44, g["T"] - 3,
-                           text=f"T日C:{tb['close']:.2f}", fill=TPRED_C,
-                           anchor="e",
+        if not bars:
+            return
+
+        # 现价标签挂在最后一根真实K线上（跳过幽灵K线）
+        pb_i = len(bars) - 1
+        while pb_i >= 0 and bars[pb_i]["date"] in ghost_lab:
+            pb_i -= 1
+        if pb_i >= 0:
+            pb = bars[pb_i]
+            cv.create_text(xs(pb_i), g["T"] - 3,
+                           text=f"C:{pb['close']:.2f}",
+                           fill=PRED_C,
                            font=("Microsoft YaHei", 8, "bold"))
-        cv.create_text(xs(len(bars) - 1), g["T"] - 3,
-                       text=f"{v.get('pred_label', 'T+1')} C:{pb['close']:.2f}",
-                       fill=PRED_C,
-                       font=("Microsoft YaHei", 8, "bold"))
+        # T+5 预测标注（图表左上角，预测P50/区间/上行概率）
+        t5v = self.res.get("t5_pred") if getattr(self, "res", None) else None
+        if t5v:
+            c5 = t5v["cl"]
+            cv.create_text(g["L"] + 2, g["T"] + 11,
+                           text=f"T+5: {c5[50]:.2f} "
+                                f"({c5[25]:.2f}~{c5[75]:.2f}) "
+                                f"↑{t5v['up_prob']*100:.0f}%",
+                           fill=PRED_C, anchor="w",
+                           font=("Microsoft YaHei", 8, "bold"))
         lx = g["L"] + 2
         for nn in sorted(MA_COLORS):
             if self.ma_on[nn].get():
@@ -4095,6 +5746,8 @@ class App:
     # ---------- 十字光标 ----------
 
     def _on_motion(self, event, key):
+        if getattr(self, "_drag_x", None) is not None:
+            return          # 拖拽平移中，不画十字光标（避免拖拽卡顿）
         """十字光标：线/标签连续跟随鼠标，数据读数吸附最近K线。"""
         if key not in self.scales or not self.view:
             return
@@ -4170,8 +5823,10 @@ class App:
                 r12 = v["rsi12"][idx]
                 ind_txt = ("  RSI6:%.1f RSI12:%s"
                            % (r6, f"{r12:.1f}" if r12 is not None else "-"))
-        if b["date"] in ("T+1预测", "T日预测"):
-            tag = "预测T+1" if b["date"] == "T+1预测" else "预测T日"
+        if b["date"] in ("T+1预测", "T日预测", "T+5预测", "T+10预测"):
+            tag = {"T+1预测": "预测T+1", "T日预测": "预测T日",
+                   "T+5预测": "预测T+5(累计)", "T+10预测": "预测T+10(累计)"
+                   }.get(b["date"], "预测")
             self.hover_var.set(
                 f"[{tag}] 开{b['open']:.2f} 高{b['high']:.2f} "
                 f"低{b['low']:.2f} 收{b['close']:.2f}")
@@ -4207,6 +5862,12 @@ class App:
         res, tp, pred, q = self.res, self.res["t_pred"], self.res["pred"], self.res["quote"]
         L = []
         L.append("=" * 64)
+        st = res.get("strategy")
+        L.append(f"当前策略: "
+                 + (st.get("label", "?") if st else "多维评分·稳健(默认·未消融)")
+                 + (f"（缓存至 {time.strftime('%m-%d %H:%M', time.localtime((st.get('ts') or 0) + STRAT_TTL))}，到期自动重新消融）"
+                    if st else "（可在工具→重选策略运行消融回测）"))
+        L.append("=" * 64)
         L.append(f"{q['name']} ({res['full_code']})  快照 {q['time']}  "
                  f"昨收 {res['prev_close']:.2f}")
         L.append(f"今开 {q['open']:.2f} (缺口 {res['gap_today']:+.2f}%)  "
@@ -4226,14 +5887,38 @@ class App:
         L.append(f"开盘->收盘 上行概率 {tp['up_prob']*100:.0f}%   "
                  f"有效样本 {res['src_n']}/{len(res['samples'])}"
                  f"（{res['filter_note']}）")
+
+        # T+5 累计预测（close→close 5日，区间校准k=1.4）
+        t5 = res.get("t5_pred")
+        if t5:
+            c5 = t5["cl"]
+            L.append(f"-- T+5预测(累计) -- n={t5['n']}")
+            L.append(f"P10 {c5[10]:.2f} | P25 {c5[25]:.2f} | "
+                     f"P50 {c5[50]:.2f} | P75 {c5[75]:.2f} | "
+                     f"P90 {c5[90]:.2f}")
+            L.append(f"5日上行概率 {t5['up_prob']*100:.0f}%")
+        
+        # 置信度信息
+        confidence = tp.get("confidence")
+        if confidence:
+            conf_level = confidence["level"]
+            conf_score = confidence["score"]
+            L.append(f"预测置信度: {conf_level}(评分{conf_score:.2f})  "
+                     f"总样本{confidence['total_samples']}只  "
+                     f"有效层级{confidence['active_levels']}/3")
+        else:
+            L.append("预测置信度: 未启用")
+        
         lv = res.get("levels") or []
         if len(lv) > 1:
             L.append("分层上行概率: " + " | ".join(
                 f"{x['label']} {x['up_prob']*100:.0f}%(n={x['n']})"
                 for x in lv))
-            w = {"L1": 0.6, "L2": 0.3, "L3": 0.1}
-            L.append(f"融合权重: " +
-                     " ".join(f"{x['label']}{w[x['key']]}" for x in lv))
+            w = _dynamic_lv_weights([(x["key"], x.get("samples") or [])
+                                     for x in lv])
+            L.append(f"融合权重({('动态' if CFG.DYNAMIC_LV_W else '固定')}): " +
+                     " ".join(f"{x['label']}{w.get(x['key'], 0):.2f}"
+                              for x in lv))
         if res.get("pool_note"):
             L.append(res["pool_note"])
         if res["has_live"] and res["clamped"]:
@@ -4246,7 +5931,7 @@ class App:
         bl_up = next((x for x in reversed(res["ind"]["boll_up"])
                       if x is not None), None)
         bl_mid = next((x for x in reversed(res["ind"]["boll_mid"])
-                       if x is not None), None)
+                      if x is not None), None)
         bl_low = next((x for x in reversed(res["ind"]["boll_low"])
                        if x is not None), None)
         if None not in (bl_up, bl_mid, bl_low):
@@ -4296,11 +5981,36 @@ class App:
             t.insert("end", s + "\n", ("c",))
             t.tag_config("c", foreground=c)
 
+        st = res.get("strategy")
+        tag("■ 当前策略: " + (st.get("label", "?") if st
+                              else "多维评分·稳健(默认·未消融)"),
+            "#ffd34d")
+        if not st:
+            p("  (工具→重选策略 可运行多算法消融回测)")
         p(f"■ 今日(T)收盘预测  [锚定{res.get('anchor', '今开')}]")
         for pp in (10, 50, 90):
             p(f"  P{pp}: 收{tp['cl'][pp]:.2f} 高{tp['hi'][pp]:.2f} 低{tp['lo'][pp]:.2f}")
         p(f"  上行概率 {tp['up_prob']*100:.0f}%  "
           f"样本{res['src_n']}/{len(res['samples'])}")
+
+        # T+5 累计预测
+        t5 = res.get("t5_pred")
+        if t5:
+            c5 = t5["cl"]
+            tag(f"  T+5: P50 {c5[50]:.2f}  区间 {c5[25]:.2f}~{c5[75]:.2f}  "
+                f"上行{t5['up_prob']*100:.0f}%", PRED_C)
+        
+        # 置信度显示
+        confidence = tp.get("confidence")
+        if confidence:
+            conf_color = UP if confidence["score"] >= CFG.MEDIUM_CONFIDENCE_SCORE else \
+                        ("#ffd34d" if confidence["score"] >= CFG.LOW_CONFIDENCE_SCORE else DOWN)
+            conf_level = confidence["level"]
+            conf_score = confidence["score"]
+            tag(f"  预测置信度: {conf_level}(评分{conf_score:.2f})  样本{confidence['total_samples']}只 层级{confidence['active_levels']}/3", conf_color)
+        else:
+            p("  预测置信度: 未启用")
+        
         idx_txt = (f"{res['idx_chg_today']:+.2f}%"
                    if res["idx_chg_today"] is not None else "未知")
         vr_txt = (f"{res['vr_now']:.2f}({res['cur_regime']})"
@@ -4405,16 +6115,18 @@ class App:
                   f"{mp['cum_cl']*100:>+7.1f}%")
         p()
         p("■ 相似历史参考日期")
-        p(f"(近{W_WINDOW}日形态匹配 Top{TOPK})")
-        p(f"{'T日':<11}{'T+1日':<11}{'次日涨跌':>8}")
+        p(f"(近{W_WINDOW}日形态匹配 候选{CFG.CANDIDATE_TOPK}→筛选{TOPK})")
+        p(f"{'T日':<11}{'T+1日':<11}{'次日涨跌':>8}{'权重':>6}{'相似度':>6}")
         for s in res["samples"]:
             n1_cl = s.get("n1_cl")
             chg1 = n1_cl * 100 if n1_cl is not None else 0
             n1_date = s.get("n1_date", "N/A")
             mark = "*" if abs((s.get("gap") or 0) * 100 - res["gap_today"]) <= 1.0 else ""
-            p(f"{s['t_date']:<11}{n1_date:<11}{chg1:>+7.1f}% {mark}")
+            weight = s.get("weight", 1.0)
+            similarity = s.get("similarity_score", 0)
+            p(f"{s['t_date']:<11}{n1_date:<11}{chg1:>+7.1f}% {mark}{weight:>5.2f}{similarity:>6.2f}")
         p()
-        p("* = 开盘缺口与今日接近")
+        p("* = 开盘缺口与今日接近  | 权重基于相似度/时间/质量  | 相似度越低越相似")
         p("──────────────────────")
         p("■ 最近买卖信号")
         sigs = res["signals"][-6:]
@@ -4855,6 +6567,12 @@ class App:
                            relief="flat", cursor="hand2",
                            font=("Microsoft YaHei", 10, "bold"))
         btn_bt.pack(pady=6, ipadx=16, ipady=4)
+        tk.Button(f_bt, text="重选策略(消融回测)", command=self._rerun_strategy,
+                  bg=BTN_BG, fg=BTN_FG,
+                  activebackground=BTN_HOVER, activeforeground=BTN_FG,
+                  relief="flat", cursor="hand2",
+                  font=("Microsoft YaHei", 10, "bold")).pack(
+                      pady=2, ipadx=10, ipady=4)
 
         # ── AI 分析（多轮对话，共享同一份数据上下文） ──
         f_ai = ttk.Frame(nb, padding=10)
@@ -4977,8 +6695,36 @@ class App:
             win.attributes("-fullscreen", True)
             win.bind("<Escape>",
                      lambda e: win.attributes("-fullscreen", False))
-        frm = ttk.Frame(win, padding=14)
-        frm.pack(fill="both", expand=True)
+        # 可滚动容器：设置内容多，小屏限高+滚轮滚动，按钮永远可达
+        maxh = int(self.root.winfo_screenheight() * 0.88)
+        cv = tk.Canvas(win, bg=DARK_BG, highlightthickness=0)
+        sb = ttk.Scrollbar(win, orient="vertical", command=cv.yview)
+        frm = ttk.Frame(cv, padding=14)
+        cv.create_window((0, 0), window=frm, anchor="nw", tags="frm")
+        cv.configure(yscrollcommand=sb.set)
+
+        def _fs_fit(_e=None):
+            cv.configure(scrollregion=cv.bbox("all"))
+            h = min(frm.winfo_reqheight() + 20, maxh)
+            try:
+                cv.configure(height=max(200, h))
+                wwidth = max(580, min(frm.winfo_reqwidth() + 40,
+                                      self.root.winfo_screenwidth() - 20))
+                win.geometry(f"{wwidth}x{h + 6}")
+            except Exception:
+                pass
+        frm.bind("<Configure>", _fs_fit)
+
+        def _wheel(e):
+            try:
+                cv.yview_scroll(-1 * (e.delta // 120), "units")
+            except Exception:
+                pass
+        cv.bind("<MouseWheel>", _wheel)
+        cv.bind("<Button-4>", lambda e: cv.yview_scroll(-1, "units"))
+        cv.bind("<Button-5>", lambda e: cv.yview_scroll(1, "units"))
+        cv.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
 
         ttk.Label(frm, text="界面主题").grid(row=0, column=0, sticky="w", pady=4)
         theme_var = tk.StringVar(value=self.settings["theme"])
@@ -5014,6 +6760,75 @@ class App:
         ent_px = ttk.Entry(frm, textvariable=proxy_var, width=42)
         ent_px.grid(row=4, column=1, columnspan=2, sticky="we", pady=4)
 
+        # ---- 预测参数（存 ini [predict]，下次启动生效）----
+        ttk.Separator(frm, orient="horizontal").grid(
+            row=5, column=0, columnspan=3, sticky="we", pady=10)
+        ttk.Label(frm, text="— 预测参数（改动后需重新分析生效）—").grid(
+            row=6, column=0, columnspan=3, sticky="w")
+
+        # 风险偏好（三级：止损宽度/移动止盈/买入阈值/冷却）
+        ttk.Label(frm, text="风险偏好").grid(row=7, column=0, sticky="w",
+                                             pady=2)
+        risk_var = tk.StringVar(value=CFG.RISK_MODE)
+        cmb_risk = ttk.Combobox(frm, textvariable=risk_var, width=8,
+                                state="readonly",
+                                values=list(CFG.RISK_PARAMS.keys()))
+        cmb_risk.grid(row=7, column=1, sticky="w", pady=2)
+        ttk.Label(frm, text="保守=宽止损少交易 激进=紧止损多交易").grid(
+            row=7, column=2, sticky="w")
+
+        def _int_var(attr, lo, hi):
+            try:
+                v = int(max(lo, min(hi, float(getattr(CFG, attr)))))
+            except (ValueError, TypeError):
+                v = getattr(CFG, attr)
+            return tk.StringVar(value=str(v))
+
+        def _float_var(attr):
+            return tk.StringVar(value=str(getattr(CFG, attr)))
+
+        prows = [
+            ("形态匹配窗口(日)", _int_var("W_WINDOW", 5, 30), "5-30"),
+            ("最终样本数", _int_var("TOPK", 3, 30), "3-30"),
+            ("候选样本数", _int_var("CANDIDATE_TOPK", 10, 100), "10-100"),
+            ("时间衰减起始(天)", _int_var("TIME_DECAY_DAYS", 0, 1095),
+             "0-1095"),
+            ("动态权重强度(0-1)", _float_var("DYN_LV_STRENGTH"),
+             "0=固定 1=全动态"),
+            ("周线回看(周)", _int_var("WEEKLY_N", 2, 8), "2-8"),
+            ("K线结构权重", _float_var("STRUCT_W"), "0-3"),
+            ("波动率权重", _float_var("VOLA_W"), "0-3"),
+            ("RSI权重", _float_var("RSI_W"), "0-3"),
+            ("量变权重", _float_var("VOLCHG_W"), "0-3"),
+            ("周线环境权重", _float_var("WEEKLY_W"), "0-3"),
+        ]
+        pvars = []
+        for i, (lab, var, hint) in enumerate(prows):
+            r = 8 + i
+            ttk.Label(frm, text=lab).grid(row=r, column=0, sticky="w",
+                                          pady=2)
+            e = ttk.Entry(frm, textvariable=var, width=10)
+            e.grid(row=r, column=1, sticky="w", pady=2)
+            ttk.Label(frm, text=hint).grid(row=r, column=2, sticky="w")
+            pvars.append((lab, var))
+
+        # ---- 使用注意（基于n=4500+回测的诚实边界）----
+        notes = (
+            "【适合】\n"
+            "· 看 T+1/T+5 价格区间（已校准，覆盖率达名义值）\n"
+            "· 强信号过滤：预测收益>1%才值得关注（阈值↑胜率↑）\n"
+            "· ETF：参考 T+5 区间（正向T+5胜率55%，z≈3.2）；\n"
+            "  预测偏空时均值信息反向，勿直接当卖出信号\n"
+            "· 传统行业个股：L1+L2(同行业+ETF) 全开\n"
+            "【不适合】\n"
+            "· 上行概率>50% 当买卖信号——方向预测无统计alpha\n"
+            "· 题材股(科技/医药)跨股参考无效，仅L1\n"
+            "· ETF 不按 T+1 信号交易（劣于买入持有）\n"
+            "· 本工具不做仓位/风控，据此操作盈亏自负")
+        ttk.Label(frm, text=notes, justify="left", foreground=AXIS_TXT,
+                  font=("Microsoft YaHei", 8)).grid(
+            row=20, column=0, columnspan=3, sticky="w", pady=(12, 0))
+
         def save():
             self.settings["theme"] = theme_var.get()
             self.settings["updown"] = ud_var.get()
@@ -5026,12 +6841,63 @@ class App:
                 set_ai_model(model_var.get().strip())
                 self._save_ini()
             apply_theme(self.settings["theme"], self.settings["updown"])
+            # 应用并持久化预测参数（非法输入自动回退默认）
+            pnotes = []
+            try:
+                cp = configparser.ConfigParser()
+                cp.read(INI_PATH, encoding="utf-8")
+                if not cp.has_section("predict"):
+                    cp.add_section("predict")
+
+                def apply_i(attr, var, lo, hi, dflt):
+                    try:
+                        v = int(float(var.get()))
+                    except (ValueError, TypeError):
+                        return
+                    v = max(lo, min(hi, v))
+                    setattr(CFG, attr, v)
+                    cp.set("predict", attr.lower(), str(v))
+                    pnotes.append(f"{attr}={v}")
+
+                def apply_f(attr, var, lo, hi):
+                    try:
+                        v = float(var.get())
+                    except (ValueError, TypeError):
+                        return
+                    v = max(lo, min(hi, v))
+                    setattr(CFG, attr, v)
+                    cp.set("predict", attr.lower(), str(v))
+                    pnotes.append(f"{attr}={v:.2f}")
+
+                apply_i("W_WINDOW", pvars[0][1], 5, 30, 10)
+                apply_i("TOPK", pvars[1][1], 3, 30, 10)
+                apply_i("CANDIDATE_TOPK", pvars[2][1], 10, 100, 50)
+                apply_i("TIME_DECAY_DAYS", pvars[3][1], 0, 1095, 90)
+                apply_f("DYN_LV_STRENGTH", pvars[4][1], 0.0, 1.0)
+                apply_i("WEEKLY_N", pvars[5][1], 2, 8, 4)
+                apply_f("STRUCT_W", pvars[6][1], 0.0, 3.0)
+                apply_f("VOLA_W", pvars[7][1], 0.0, 3.0)
+                apply_f("RSI_W", pvars[8][1], 0.0, 3.0)
+                apply_f("VOLCHG_W", pvars[9][1], 0.0, 3.0)
+                apply_f("WEEKLY_W", pvars[10][1], 0.0, 3.0)
+                if risk_var.get() in CFG.RISK_PARAMS:
+                    CFG.RISK_MODE = risk_var.get()
+                    cp.set("predict", "risk_mode", CFG.RISK_MODE)
+                    pnotes.append(f"风险={CFG.RISK_MODE}")
+                # 同步模块级别名（W_WINDOW/TOPK 被算法直接引用）
+                globals()["W_WINDOW"] = CFG.W_WINDOW
+                globals()["TOPK"] = CFG.TOPK
+                with open(INI_PATH, "w", encoding="utf-8") as f:
+                    cp.write(f)
+            except Exception:
+                log.exception("保存预测参数失败(忽略)")
             self._rebuild_ui()
             win.destroy()
             self.progress_var.set(
                 "设置已保存 · AI模型 " + AI_MODEL
                 + (f"，代理 {self.proxy_url}" if self.proxy_url
-                   else "（未用代理）"))
+                   else "（未用代理）")
+                + (f" · 预测参数x{len(pnotes)}" if pnotes else ""))
 
         def clear_cache():
             if not messagebox.askyesno(
@@ -5054,7 +6920,7 @@ class App:
                 messagebox.showerror("清除缓存", str(e))
 
         btns = ttk.Frame(frm)
-        btns.grid(row=5, column=0, columnspan=3, pady=(12, 0))
+        btns.grid(row=19, column=0, columnspan=3, pady=(12, 0))
         ttk.Button(btns, text="保存并应用", command=save).pack(
             side="left", padx=4)
         ttk.Button(btns, text="清除缓存", command=clear_cache).pack(
@@ -5119,6 +6985,21 @@ class App:
             self._rerender()
         self._update_indices()
         self._update_sectors()
+
+
+def _cleanup():
+    """程序退出时清理线程池，避免僵尸线程。"""
+    try:
+        _SHARED_EX.shutdown(wait=False)
+    except Exception:
+        pass
+    try:
+        _BG_EX.shutdown(wait=False)
+    except Exception:
+        pass
+
+
+atexit.register(_cleanup)
 
 
 def main():
