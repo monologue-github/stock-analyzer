@@ -6,6 +6,7 @@ stock_cache.db-*
 # 运行日志 / 备份 / 字节码
 *.log
 *.bak
+*.pkl
 __pycache__/
 *.py[cod]
 
