@@ -5042,6 +5042,10 @@ _V4_VARIANTS = {
     "TrailSlow": {"trail_slow": True},
     "T10only+Reentry": {"h_only": 10, "cooldown": 5,
                         "min_hold": 5, "reentry_tier": True},
+    "Dist+Reentry": {"exit_mode": "dist", "reentry_tier": True},
+    "Dist+Reentry+Cd5": {"exit_mode": "dist", "reentry_tier": True,
+                         "cooldown": 5, "min_hold": 5},
+    "Hybrid (v4.0.1)": {"exit_mode": "hybrid"},   # 隔离默认 dist vs hybrid
 }
 
 
@@ -5262,10 +5266,9 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
     - 信号日收盘成交；买入=收盘×(1+滑点)(1+佣金)；卖出=×(1-滑点)(1-佣金-印花税)
       （v4.0.1 起佣金/印花税记 0，仅保留滑点）
     - 涨停禁买、跌停顺延；停牌持仓顺延；期末强平
-    - hybrid 混合退出（默认）：Q10棘轮止损（只收紧）+ 移动止盈棘轮 + p_up 信号退出
-    - 降频开关（cooldown/min_hold）默认关闭——实测冷却损害收益；T10only 变体供低频选择
-    - exit_mode="dist"：v4.0 纯分布退出（Q10棘轮 + Q75硬目标 + p_up，实测持仓被压到4.7天）
-    - 对照退出：ATR止损/移动止盈（v3.3 稳健参数）
+    - dist 分布退出（默认）：Q10棘轮止损（只收紧）+ Q75目标 + p_up 信号退出
+    - hybrid 混合退出（消融对照）：Q10棘轮 + 移动止盈棘轮 + p_up（修正 bug 后实证劣于 dist）
+    - 对照退出：ATR止损/移动止盈（v3.3 稳健参数，highest 逐日更新）
     - baseline：v3.3 多维评分信号进出
     """
     cal, M, codes = mats
@@ -5273,7 +5276,9 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
     mode = rules.get("mode", "full")
     use_dist = rules.get("use_dist_exit", True) \
         and rules.get("use_quantile", True)
-    exit_mode = rules.get("exit_mode", "hybrid")
+    # 默认 dist（v4.0 纯分布退出）：修正 highest 逐日更新 bug 后的全量实证
+    # 显示 1.02/0.94 移动止盈在组合级是最大拖累（-13pp vs dist），dist 全场最优
+    exit_mode = rules.get("exit_mode", "dist")
     # 降频开关（默认关闭！300只实测：冷却5根反而把年化 +10.6%→-3.1%——
     # 退出后信号仍有效时快速再入场是收益来源之一，勿硬压频率）。
     # cooldown=平仓后同股再入场冷却根数；min_hold=p_up 信号退出前最少持仓根数
@@ -5313,6 +5318,7 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
             px_o = float(M["open"][ks, t])
             hi = float(M["high"][ks, t])
             lo = float(M["low"][ks, t])
+            p["highest"] = max(p["highest"], hi)   # 逐日更新最高价（v3.3 同口径；此前缺失→移动止盈失效）
             sold = False
             if not M["limit_dn"][ks, t]:
                 if mode == "baseline" or p["atr_fallback"] or not use_dist:
