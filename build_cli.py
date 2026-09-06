@@ -27,12 +27,14 @@ CLI_HEADER = '''#!/usr/bin/env python3
 K线源自动切换：腾讯(三域名轮换) -> 东财 -> 网易163 -> 新浪；支持代理。
 
 用法：python stock_predict.py [--push] [--refresh-cache] [--backfill]
-                             [--clean] [--research] [股票代码]
+                             [--clean] [--research] [--v4 [--v4-limit N]]
+                             [股票代码]
   --push           分析完成后把报告推送到 Pi 量化系统收件箱（ai-quant）
   --refresh-cache  刷新全市场代码表/市值分层（约1分钟，7天有效）
   --backfill       全市场1000交易日日K回填（断点续传，配额内自动分晚完成）
   --clean          数据清洗（结构异常/除权残留/退市/粘性，扫描+修复）
   --research       全A研究报告：各算法 IC/胜率/年化/回撤 跨股聚合
+  --v4             v4.0 全A研究：Walk-Forward自适应ML + 三档风险回测 + 消融
 """
 
 '''

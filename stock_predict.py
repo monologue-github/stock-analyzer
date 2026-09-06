@@ -9,12 +9,14 @@
 K线源自动切换：腾讯(三域名轮换) -> 东财 -> 网易163 -> 新浪；支持代理。
 
 用法：python stock_predict.py [--push] [--refresh-cache] [--backfill]
-                             [--clean] [--research] [股票代码]
+                             [--clean] [--research] [--v4 [--v4-limit N]]
+                             [股票代码]
   --push           分析完成后把报告推送到 Pi 量化系统收件箱（ai-quant）
   --refresh-cache  刷新全市场代码表/市值分层（约1分钟，7天有效）
   --backfill       全市场1000交易日日K回填（断点续传，配额内自动分晚完成）
   --clean          数据清洗（结构异常/除权残留/退市/粘性，扫描+修复）
   --research       全A研究报告：各算法 IC/胜率/年化/回撤 跨股聚合
+  --v4             v4.0 全A研究：Walk-Forward自适应ML + 三档风险回测 + 消融
 """
 
 
@@ -4526,6 +4528,1232 @@ def analyze(full, progress=None, quick=False):
         },
     }
 
+
+# ================= v4.0 自适应ML研究引擎 =================
+# 设计约束（防数据泄漏）：
+#   1. 特征只用 T 日及以前数据；标签 = Close[T+H]/Close[T]-1 仅作训练目标
+#   2. StandardScaler / Lasso 因子筛选 / Horizon 选择 全部只看训练段
+#   3. Walk-Forward 扩展窗：每折用折前全部数据训练，折内预测，折间不重叠
+#   4. LightGBM 超参先验固定（浅树/少叶/强正则/子采样），不用 Test 调参
+#   5. ATR/移动止盈风控保留为对照退出（消融 + 极端行情防火墙），不删除
+
+_V4_FACTORS = ("l1_up", "l1_ret", "bias20", "bias60", "ret5", "ret10",
+               "ret20", "rsi14", "atr_pct", "vola20", "volchg",
+               "mkt5", "ind5")
+_V4_HORIZONS = (1, 5, 10)
+_V4_FOLD = 40            # Walk-Forward 折大小（交易日）
+_V4_WARMUP = 60          # 因子预热期
+_V4_TRAIN_MIN = 180      # 首折最少训练样本
+_V4_QTS = (10, 25, 50, 75, 90)
+_V4_COST = {"slip": 0.001, "commission": 0.0003, "stamp": 0.001}
+_V4_CAPITAL = 1_000_000.0
+
+# 三档风险：同一套 v4 模型输出上的不同决策层参数（不分别训练）
+# a_th 为自适应分数的 σ 阈值（训练段标准化后）
+_V4_TIERS = {
+    "保守": {"p_th": 0.62, "r_th": 0.012, "a_th": 1.00,
+             "frac": 0.12, "max_pos": 10, "exit_p": 0.50},
+    "平衡": {"p_th": 0.55, "r_th": 0.006, "a_th": 0.70,
+             "frac": 0.20, "max_pos": 6, "exit_p": 0.45},
+    "激进": {"p_th": 0.52, "r_th": 0.000, "a_th": 0.40,
+             "frac": 0.33, "max_pos": 4, "exit_p": 0.45},
+}
+
+# LightGBM 先验超参（防过拟合：浅树/少叶/强正则/子采样，不按Test调）
+_V4_LGBM = {"objective": "regression", "num_leaves": 15, "max_depth": 4,
+            "learning_rate": 0.05, "n_estimators": 200,
+            "min_child_samples": 40, "subsample": 0.8, "subsample_freq": 1,
+            "colsample_bytree": 0.8, "reg_lambda": 1.0, "reg_alpha": 0.0,
+            "random_state": 42, "n_jobs": 1, "verbose": -1}
+
+
+def _v4_deps():
+    """依赖探测：缺库时如实记录，不偷偷换模型。"""
+    out = {}
+    for m in ("numpy", "sklearn", "lightgbm", "scipy"):
+        try:
+            mod = __import__(m)
+            out[m] = getattr(mod, "__version__", "?")
+        except ImportError:
+            out[m] = None
+    return out
+
+
+def _v4_rankic(a, b):
+    """Spearman 秩相关（numpy 实现）。样本不足/无差异返回 None。"""
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    m = np.isfinite(a) & np.isfinite(b)
+    a, b = a[m], b[m]
+    if len(a) < 25:
+        return None
+    ra = a.argsort().argsort().astype(np.float64)
+    rb = b.argsort().argsort().astype(np.float64)
+    ra -= ra.mean()
+    rb -= rb.mean()
+    den = math.sqrt(float((ra * ra).sum()) * float((rb * rb).sum()))
+    return float((ra * rb).sum() / den) if den > 0 else None
+
+
+def _v4_roll_mean(a, w):
+    n = len(a)
+    out = np.full(n, np.nan)
+    if n >= w:
+        c = np.cumsum(np.insert(np.asarray(a, float), 0, 0.0))
+        out[w - 1:] = (c[w:] - c[:-w]) / w
+    return out
+
+
+def _v4_roll_std(a, w):
+    m = _v4_roll_mean(a, w)
+    m2 = _v4_roll_mean(np.asarray(a, float) ** 2, w)
+    return np.sqrt(np.maximum(m2 - m * m, 0.0))
+
+
+# ---- 市场/行业日收益上下文（worker 进程初始化时注入，只读） ----
+_V4_MKT_CTX = None      # (dates, cumsum, bisect_right)
+_V4_IND_CTX = None      # {industry: (dates, cumsum, bisect_right)}
+
+
+def _v4_worker_init(mkt, ind):
+    global _V4_MKT_CTX, _V4_IND_CTX
+    from bisect import bisect_right as _br
+
+    def _ctx(dct):
+        if not dct:
+            return None
+        dates = sorted(dct)
+        rets = np.array([dct[x] for x in dates], float)
+        c = np.cumsum(np.insert(rets, 0, 0.0))
+        return (dates, c, _br)
+
+    _V4_MKT_CTX = _ctx(mkt)
+    _V4_IND_CTX = {k: _ctx(v) for k, v in (ind or {}).items() if v}
+
+
+def _v4_roll5_ret(ctx, d):
+    """截至日期 d（含）近5个交易日的等权累计收益；不足按实际天数；缺→0。"""
+    if ctx is None:
+        return 0.0
+    dates, c, br = ctx
+    i = br(dates, d) - 1
+    if i < 0:
+        return 0.0
+    j0 = max(0, i - 4)
+    return float((c[i + 1] - c[j0]) / (i + 1 - j0))
+
+
+def _v4_factor_matrix(bars, industry):
+    """T 日因子矩阵（仅用 T 及以前数据）。返回 (F[n×13], aux dict)。
+
+    因子：L1形态上行概率/相似样本收益（逐日匹配，与 _sig_l1_pattern 同口径）、
+    MA20/60 乖离、5/10/20 日收益、RSI14、ATR14/Close、20日波动、量变(5/20)、
+    大盘5日收益、行业5日收益（市场日历口径，停牌日不产生缺口）。"""
+    n = len(bars)
+    dates = [b["date"] for b in bars]
+    close = np.array([(b["close"] if b["close"] else np.nan)
+                      for b in bars], float)
+    high = np.array([(b["high"] if b["high"] else np.nan)
+                     for b in bars], float)
+    low = np.array([(b["low"] if b["low"] else np.nan)
+                    for b in bars], float)
+    vol = np.array([(b.get("vol") or 0.0) for b in bars], float)
+    F = np.full((n, len(_V4_FACTORS)), np.nan)
+    fi = {f: k for k, f in enumerate(_V4_FACTORS)}
+
+    lr = np.zeros(n)                    # lr[t]=log(c[t]/c[t-1])，与logret同口径
+    lr[1:] = np.diff(np.log(np.maximum(close, 1e-9)))
+    ret1 = np.zeros(n)
+    ret1[1:] = close[1:] / close[:-1] - 1.0
+
+    ma20 = _v4_roll_mean(close, 20)
+    ma60 = _v4_roll_mean(close, 60)
+    F[:, fi["bias20"]] = close / np.maximum(ma20, 1e-9) - 1.0
+    F[:, fi["bias60"]] = close / np.maximum(ma60, 1e-9) - 1.0
+    for k, f in ((5, "ret5"), (10, "ret10"), (20, "ret20")):
+        F[k:, fi[f]] = close[k:] / np.maximum(close[:-k], 1e-9) - 1.0
+
+    d1 = np.diff(close, prepend=close[:1])
+    up = _v4_roll_mean(np.where(d1 > 0, d1, 0.0), 14)
+    dn = _v4_roll_mean(np.where(d1 < 0, -d1, 0.0), 14)
+    rsi = 100.0 - 100.0 / (1.0 + up / np.maximum(dn, 1e-12))
+    rsi[(up + dn) <= 0] = 50.0
+    F[:, fi["rsi14"]] = rsi
+
+    tr = np.zeros(n)
+    tr[1:] = np.maximum(high[1:] - low[1:], np.maximum(
+        np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])))
+    atr = _v4_roll_mean(tr, 14)
+    F[:, fi["atr_pct"]] = atr / np.maximum(close, 1e-9)
+    F[:, fi["vola20"]] = _v4_roll_std(lr, 20)
+    v5 = _v4_roll_mean(vol, 5)
+    v20 = _v4_roll_mean(vol, 20)
+    F[:, fi["volchg"]] = v5 / np.maximum(v20, 1e-9) - 1.0
+
+    if _V4_MKT_CTX is not None:
+        F[:, fi["mkt5"]] = [_v4_roll5_ret(_V4_MKT_CTX, x) for x in dates]
+    ictx = _V4_IND_CTX.get(industry) if _V4_IND_CTX else None
+    if ictx is not None:
+        F[:, fi["ind5"]] = [_v4_roll5_ret(ictx, x) for x in dates]
+    else:
+        F[:, fi["ind5"]] = 0.0
+
+    # L1 形态两因子：逐日自身历史匹配（只用当日以前窗口，防前视）
+    W = W_WINDOW
+    L = lr[1:]                          # 与 logret(closes) 完全同口径
+    for t in range(2 * W + 1, n - 1):
+        cur = znorm(L[t - W:t])
+        d_arr = _px_distances(L[:t], cur, W)
+        ks = [k for k in range(len(d_arr)) if k + W <= t - W]
+        if len(ks) < 6:
+            continue
+        ks.sort(key=lambda k: d_arr[k])
+        ups = tot = sret = 0.0
+        for k in ks[:CFG.TOPK]:
+            j = k + W
+            if j + 1 < n:
+                tot += 1.0
+                o = close[j + 1] / close[j] - 1.0
+                sret += o
+                ups += 1.0 if o > 0 else 0.0
+        if tot >= 5:
+            F[t, fi["l1_up"]] = ups / tot
+            F[t, fi["l1_ret"]] = sret / tot
+
+    aux = {"dates": dates, "close": close, "high": high, "low": low,
+           "open": np.array([(b["open"] if b["open"] else np.nan)
+                             for b in bars], float),
+           "atr": atr, "ret1": ret1}
+    return F, aux
+
+
+def _v4_walkforward_one(job):
+    """多进程 worker：单股 Walk-Forward 训练+预测（顶层函数可 pickle）。"""
+    code, bars, industry = job
+    try:
+        return _v4_wf_impl(code, bars, industry)
+    except Exception:
+        log.exception("v4 worker 失败 %s", code)
+        return None
+
+
+def _v4_wf_impl(code, bars, industry):
+    from sklearn.linear_model import (Lasso, LogisticRegression,
+                                      QuantileRegressor)
+    try:
+        from lightgbm import LGBMRegressor
+        has_lgbm = True
+    except ImportError:
+        has_lgbm = False
+
+    n = len(bars)
+    if n < _V4_WARMUP + _V4_TRAIN_MIN + _V4_FOLD + max(_V4_HORIZONS):
+        return None
+    F, aux = _v4_factor_matrix(bars, industry)
+    dates, close, high, low, open_, atr, ret1 = (
+        aux["dates"], aux["close"], aux["high"], aux["low"], aux["open"],
+        aux["atr"], aux["ret1"])
+    y = {}
+    for H in _V4_HORIZONS:
+        a = np.full(n, np.nan)
+        a[:n - H] = close[H:] / close[:n - H] - 1.0
+        y[H] = a
+
+    # 有效区间：因子全 finite 的最长连续尾段
+    finite = np.all(np.isfinite(F), axis=1)
+    t0 = _V4_WARMUP
+    last_ok = n - 1 - max(_V4_HORIZONS)
+    while t0 <= last_ok and not finite[t0]:
+        t0 += 1
+    t1 = last_ok
+    while t1 >= t0 and not finite[t1]:
+        t1 -= 1
+    S = t1 - t0 + 1
+    if S < _V4_TRAIN_MIN + _V4_FOLD:
+        return None
+    n_folds = max(1, int(S * 0.4) // _V4_FOLD)
+    if S - n_folds * _V4_FOLD < _V4_TRAIN_MIN:
+        n_folds -= 1
+    if n_folds < 1:
+        return None
+    fa = S - n_folds * _V4_FOLD
+    TS = S - fa
+
+    Fc = F[t0:t1 + 1].copy()
+    bad = ~np.isfinite(Fc)
+    if bad.any():
+        Fc[bad] = 0.0                   # 中段孤立缺失中性填充
+    Yc = {H: y[H][t0:t1 + 1] for H in _V4_HORIZONS}
+    base_sigs = {}
+    try:
+        for i, d_, typ, _rs in _composite_signals(
+                bars, CFG.RISK_PARAMS["稳健"], use_chips=False):
+            if i - t0 >= fa:
+                base_sigs[d_] = typ
+    except Exception:
+        base_sigs = {}
+
+    ml = {H: np.full(TS, np.nan) for H in _V4_HORIZONS}
+    p_up = np.full(TS, np.nan)
+    adaptive = np.full(TS, np.nan)
+    qpred = {q: np.full(TS, np.nan) for q in _V4_QTS}
+    hch = np.zeros(TS, dtype=np.int32)
+    ins_ic = []                         # LGBM 训练段内IC（过拟合检查）
+    q_cross_raw = [0, 0]                # 违反序的相邻对数 / 总对数
+    factor_table = None
+    feat_imp = None
+    per_stock_ic = {H: [] for H in _V4_HORIZONS}
+
+    for j in range(n_folds):
+        b = S - j * _V4_FOLD
+        a = b - _V4_FOLD
+        ta, tb = a - fa, b - fa         # 测试段输出数组内的偏移索引
+        tr = np.arange(0, a)
+        mu = Fc[tr].mean(axis=0)
+        sd = Fc[tr].std(axis=0)
+        sd[sd < 1e-9] = 1.0
+        Z = (Fc - mu) / sd              # 仅训练段统计量，测试行同缩放
+        # 1) Horizon 选择：训练段内层 75/25 时序切分的 LGBM IC（不看测试）
+        cut = int(len(tr) * 0.75)
+        h_ic = {}
+        for H in _V4_HORIZONS:
+            if not has_lgbm or cut < 60 or len(tr) - cut < 30:
+                h_ic[H] = 0.0
+                continue
+            try:
+                m_ = LGBMRegressor(**_V4_LGBM).fit(Z[tr[:cut]],
+                                                   Yc[H][tr[:cut]])
+                h_ic[H] = _v4_rankic(m_.predict(Z[tr[cut:]]),
+                                     Yc[H][tr[cut:]]) or 0.0
+            except Exception:
+                h_ic[H] = 0.0
+        h_star = max(_V4_HORIZONS, key=lambda H: h_ic[H])
+        hch[ta:tb] = h_star
+        yh = Yc[h_star][tr]
+        # 2) Lasso 因子筛选/权重（标准化后，训练段 only）
+        las = Lasso(alpha=0.005, max_iter=5000).fit(Z[tr], yh)
+        coef = np.asarray(las.coef_, float)
+        ic_m = np.zeros(len(_V4_FACTORS))
+        icir = np.zeros(len(_V4_FACTORS))
+        segs = np.array_split(tr, 4)
+        for i in range(len(_V4_FACTORS)):
+            ics = [_v4_rankic(Z[s_, i], yh[s_]) for s_ in segs]
+            ics = [x for x in ics if x is not None]
+            if ics:
+                ic_m[i] = float(np.mean(ics))
+                icir[i] = ic_m[i] / max(float(np.std(ics)), 1e-6)
+        sel = np.array([
+            (coef[i] != 0.0) or (abs(ic_m[i]) > 0.02 and icir[i] > 0.2)
+            for i in range(len(_V4_FACTORS))])
+        if sel.sum() < 3:
+            sel = np.ones(len(_V4_FACTORS), bool)
+        # 自适应权重：Lasso 稀疏权重优先；若被全量收缩为零，
+        # 退回 IC×稳定性 加权（同样只看训练段）
+        if np.any(coef != 0.0):
+            w_eff = coef.copy()
+        else:
+            w_eff = np.array([
+                ic_m[i] * min(icir[i], 3.0)
+                if (abs(ic_m[i]) > 0.02 and icir[i] > 0.2) else 0.0
+                for i in range(len(_V4_FACTORS))])
+        Xs = Z[:, sel]
+        # 3) LightGBM：全训练段拟合，折内预测（各 H 都要，Horizon 实验用）
+        if has_lgbm:
+            for H in _V4_HORIZONS:
+                try:
+                    m_ = LGBMRegressor(**_V4_LGBM).fit(Xs[tr], Yc[H][tr])
+                    ml[H][ta:tb] = m_.predict(Xs[a:b])
+                    if H == h_star:
+                        ins_ic.append(_v4_rankic(m_.predict(Xs[tr]),
+                                                 yh) or 0.0)
+                        if j == 0:
+                            feat_imp = sorted(
+                                zip([f for i_, f in enumerate(_V4_FACTORS)
+                                     if sel[i_]],
+                                    m_.booster_.feature_importance("gain")),
+                                key=lambda x: -x[1])
+                except Exception:
+                    pass
+            for H in _V4_HORIZONS:
+                ic = _v4_rankic(ml[H][ta:tb], Yc[H][a:b])
+                if ic is not None:
+                    per_stock_ic[H].append(ic)
+        else:
+            for H in _V4_HORIZONS:
+                ml[H][ta:tb] = 0.0      # 缺库占位（如实标记，不偷偷换模型）
+        # 4) Logistic 方向概率
+        try:
+            lg = LogisticRegression(C=1.0, max_iter=500).fit(
+                Xs[tr], (yh > 0))
+            p_up[ta:tb] = lg.predict_proba(Xs[a:b])[:, 1]
+        except Exception:
+            pass
+        # 5) Quantile Regression（训练段；排序消除交叉并记录原始交叉率）
+        try:
+            qs = []
+            for q in _V4_QTS:
+                qm = QuantileRegressor(quantile=q / 100.0, alpha=0.01,
+                                       solver="highs").fit(Xs[tr], yh)
+                qs.append(qm.predict(Xs[a:b]))
+            Q = np.column_stack(qs)
+            for r_ in range(Q.shape[0]):
+                for c_ in range(Q.shape[1] - 1):
+                    q_cross_raw[1] += 1
+                    if Q[r_, c_] > Q[r_, c_ + 1] + 1e-12:
+                        q_cross_raw[0] += 1
+            Q = np.sort(Q, axis=1)      # 投影到非交叉（保守修复，如实记录）
+            for qi, q in enumerate(_V4_QTS):
+                qpred[q][ta:tb] = Q[:, qi]
+        except Exception:
+            pass
+        adaptive[ta:tb] = (Z[a:b] @ w_eff) / max(float((Z[tr] @ w_eff).std()),
+                                                 1e-9)  # 训练段σ归一
+        if j == 0:
+            factor_table = [{"factor": f, "weight": float(w_eff[i]),
+                             "train_ic": float(ic_m[i]),
+                             "stability": float(icir[i]),
+                             "selected": bool(sel[i])}
+                            for i, f in enumerate(_V4_FACTORS)]
+
+    if not np.isfinite(p_up).any() and not any(
+            np.isfinite(ml[H]).any() for H in _V4_HORIZONS):
+        return None
+    out = {
+        "code": code,
+        "dates": dates[t0 + fa:t0 + S],
+        "close": close[t0 + fa:t0 + S].astype(np.float32),
+        "open": open_[t0 + fa:t0 + S].astype(np.float32),
+        "high": high[t0 + fa:t0 + S].astype(np.float32),
+        "low": low[t0 + fa:t0 + S].astype(np.float32),
+        "atr": atr[t0 + fa:t0 + S].astype(np.float32),
+        "ret1": ret1[t0 + fa:t0 + S].astype(np.float32),
+        "l1_up": F[t0 + fa:t0 + S, 0].astype(np.float32),
+        "l1_ret": F[t0 + fa:t0 + S, 1].astype(np.float32),
+        "y": {H: Yc[H][fa:].astype(np.float32) for H in _V4_HORIZONS},
+        "ml": {H: ml[H].astype(np.float32) for H in _V4_HORIZONS},
+        "p_up": p_up.astype(np.float32),
+        "adaptive": adaptive.astype(np.float32),
+        "q": {str(q): qpred[q].astype(np.float32) for q in _V4_QTS},
+        "h_choice": hch,
+        "base_sigs": base_sigs,
+        "ins_ic": float(np.mean(ins_ic)) if ins_ic else None,
+        "q_cross": (q_cross_raw[0] / q_cross_raw[1]) if q_cross_raw[1] else 0.0,
+        "factor_table": factor_table,
+        "feat_imp": feat_imp,
+        "per_stock_ic": per_stock_ic,
+        "n_folds": n_folds,
+        "train_last": int(t0 + fa),
+    }
+    return out
+
+
+# ---- v4 组合级回测（统一：初始资金/成本/滑点/成交时点/涨跌停/停牌） ----
+
+def _v4_limit_pct(code):
+    """涨跌停幅度：创业板/科创板20%，主板10%（北交所不参与回测）。"""
+    if code.startswith(("sz30", "sh68")):
+        return 0.20
+    return 0.10
+
+
+def _v4_metrics(eq_curve, dates, trades, stock_days=0):
+    """组合绩效：总收益/年化/最大回撤/Calmar/Sharpe/胜率/盈亏比/交易数/
+    平均持仓天数/最大连续亏损/收益波动率。"""
+    import datetime as _dt
+    eq = np.asarray(eq_curve, float)
+    n = len(eq)
+    out = {"total": 0.0, "ann": 0.0, "mdd": 0.0, "calmar": None,
+           "sharpe": None, "vol": 0.0, "winrate": None, "pf": None,
+           "trades": len(trades), "avg_hold": None,
+           "max_consec_loss": 0, "stock_days": stock_days, "days": n}
+    if n < 2 or eq[0] <= 0:
+        return out
+    total_mult = float(eq[-1] / eq[0])
+    out["total"] = total_mult - 1.0
+    try:
+        d0 = _dt.date.fromisoformat(dates[0])
+        d1 = _dt.date.fromisoformat(dates[-1])
+        years = max((d1 - d0).days / 365.25, 1e-6)
+    except Exception:
+        years = max(n / 252.0, 1e-6)
+    out["ann"] = total_mult ** (1.0 / years) - 1.0 if total_mult > 0 else -1.0
+    daily = np.diff(eq) / eq[:-1]
+    sd = float(daily.std())
+    out["vol"] = sd * math.sqrt(252.0) if n > 2 else 0.0
+    if sd > 1e-12:
+        out["sharpe"] = float(daily.mean()) / sd * math.sqrt(252.0)
+    peak = eq[0]
+    mdd = 0.0
+    for v in eq:
+        peak = max(peak, v)
+        if peak > 0:
+            mdd = min(mdd, v / peak - 1.0)
+    out["mdd"] = float(mdd)
+    if out["mdd"] < -1e-9:
+        out["calmar"] = out["ann"] / abs(out["mdd"])
+    if trades:
+        wins = [t for t in trades if t["ret"] > 0]
+        losses = [t for t in trades if t["ret"] <= 0]
+        out["winrate"] = len(wins) / len(trades)
+        gp = sum(t["pnl"] for t in wins)
+        gl = -sum(t["pnl"] for t in losses)
+        out["pf"] = (gp / gl) if gl > 1e-9 else (None if gp <= 0 else 99.0)
+        out["avg_hold"] = float(np.mean([t["hold"] for t in trades]))
+        consec = worst = 0
+        for t in trades:
+            consec = consec + 1 if t["ret"] <= 0 else 0
+            worst = max(worst, consec)
+        out["max_consec_loss"] = worst
+    return out
+
+
+# 消融变体（决策层开关；同一套 Walk-Forward 预测输出，不重训）
+_V4_VARIANTS = {
+    "Full v4": {},
+    "Full - Adaptive": {"use_adaptive": False},
+    "Full - Horizon": {"adaptive_h": False},
+    "Full - Logistic": {"use_logistic": False},
+    "Full - LightGBM": {"use_lgbm": False},
+    "Full - Quantile": {"use_quantile": False, "use_dist_exit": False},
+    "Full - DistributionExit": {"use_dist_exit": False},
+    "Adaptive+Horizon": {"use_logistic": False, "use_lgbm": False},
+    "Adaptive+LightGBM": {"use_logistic": False, "adaptive_h": False,
+                          "use_dist_exit": False},
+    "Logistic+LightGBM": {"use_adaptive": False, "use_dist_exit": False},
+    "LightGBM+Quantile": {"use_logistic": False, "use_adaptive": False},
+    "Adaptive+Horizon+LightGBM": {"use_logistic": False,
+                                  "use_dist_exit": False},
+}
+
+
+def _v4_portfolio_sim(preds, tier, rules, initial=_V4_CAPITAL):
+    """组合级事件回测。
+
+    - 信号日收盘成交（与 v3.3 同口径）；买入价 = 收盘×(1+滑点)×(1+佣金)
+    - 卖出净价 = 成交价×(1-滑点)×(1-佣金-印花税)；涨停禁买、跌停顺延
+    - 停牌日无bar → 持仓顺延
+    - 分布退出：Q10止损棘轮（只能收紧）+ Q75目标 + p_up 信号退出
+    - 对照退出：ATR止损/移动止盈（v3.3 稳健参数，防火墙/消融用）
+    - baseline 模式：v3.3 多维评分信号进出（rules 关闭全部 v4 条件）
+    """
+    rp = CFG.RISK_PARAMS["稳健"]
+    mode = rules.get("mode", "full")
+    use_dist = rules.get("use_dist_exit", True) \
+        and rules.get("use_quantile", True)
+    cost = _V4_COST
+    by_date = {}
+    for r in preds:
+        for i, d in enumerate(r["dates"]):
+            by_date.setdefault(d, []).append((r, i))
+    cal = sorted(by_date)
+    if not cal:
+        return _v4_metrics([], [], [])
+    cash = initial
+    pos = {}
+    last_close = {}
+    eq_curve = []
+    trades = []
+    fin = np.isfinite
+    for d in cal:
+        day_map = {r["code"]: (r, i) for r, i in by_date[d]}
+        for code, (r, i) in day_map.items():
+            last_close[code] = float(r["close"][i])
+        # ---- 退出（先卖后买，同 v3.3 口径）----
+        for code in sorted(pos):
+            got = day_map.get(code)
+            if got is None:
+                continue            # 停牌：持仓顺延
+            r, i = got
+            p = pos[code]
+            p["t_at"] = i
+            px_c = float(r["close"][i])
+            px_o = float(r["open"][i])
+            hi = float(r["high"][i])
+            lo = float(r["low"][i])
+            ret_t = float(r["ret1"][i])
+            lim = _v4_limit_pct(code)
+            sold = False
+            if ret_t > -(lim - 0.005):          # 跌停日无法卖出，顺延
+                if mode == "baseline" or p.get("atr_fallback") or not use_dist:
+                    # ATR止损/移动止盈（v3.3 口径）
+                    atr_t = float(r["atr"][i])
+                    if p["highest"] > p["entry"] * rp["trail_trigger"]:
+                        stop = p["highest"] * rp["trail_ratio"]
+                    else:
+                        stop = p["entry"] - rp["atr_mult"] * max(atr_t, 1e-9)
+                    if lo <= stop:
+                        px = px_o if px_o <= stop else min(stop, hi)
+                        sold = True
+                    elif mode == "baseline" \
+                            and r["base_sigs"].get(d) == "SELL":
+                        px = px_c
+                        sold = True
+                else:
+                    # 预测分布退出：Q10止损棘轮（只能收紧）+ Q75目标 + p_up
+                    q10 = float(r["q"]["10"][i])
+                    if fin(r["q"]["10"][i]):
+                        p["stop"] = max(p["stop"], p["entry"] * (1.0 + q10))
+                    if lo <= p["stop"]:
+                        px = px_o if px_o <= p["stop"] else min(p["stop"], hi)
+                        sold = True
+                    elif hi >= p["target"]:
+                        px = px_o if px_o >= p["target"] else p["target"]
+                        sold = True
+                    elif rules.get("use_logistic", True) \
+                            and fin(r["p_up"][i]) \
+                            and float(r["p_up"][i]) < tier["exit_p"]:
+                        px = px_c
+                        sold = True
+            if sold:
+                net = px * (1 - cost["slip"]) * (1 - cost["commission"]
+                                                 - cost["stamp"])
+                cash += p["shares"] * net
+                trades.append({"code": code, "ret": net / p["buy_net"] - 1.0,
+                               "pnl": p["shares"] * (net - p["buy_net"]),
+                               "hold": i - p["t_in"], "exit_d": d})
+                del pos[code]
+        # ---- 入场 ----
+        if len(pos) < tier["max_pos"]:
+            for r, i in by_date[d]:
+                code = r["code"]
+                if code in pos or len(pos) >= tier["max_pos"]:
+                    continue
+                ok = True
+                if mode == "baseline":
+                    if r["base_sigs"].get(d) != "BUY":
+                        ok = False
+                else:
+                    if rules.get("use_logistic", True):
+                        pv = float(r["p_up"][i])
+                        if not fin(pv) or pv < tier["p_th"]:
+                            ok = False
+                    if ok and rules.get("use_lgbm", True):
+                        H = int(r["h_choice"][i]) \
+                            if rules.get("adaptive_h", True) \
+                            else int(rules.get("h_fixed", 5))
+                        arr = r["ml"].get(H)
+                        rv = float(arr[i]) if arr is not None else float("nan")
+                        if not fin(rv) or rv < tier["r_th"]:
+                            ok = False
+                    elif ok and rules.get("use_quantile", True):
+                        rv = float(r["q"]["50"][i])
+                        if not fin(rv) or rv < tier["r_th"]:
+                            ok = False
+                    if ok and rules.get("use_quantile", True) \
+                            and rules.get("q50_entry", True) \
+                            and rules.get("use_lgbm", True):
+                        q50v = float(r["q"]["50"][i])
+                        if not fin(q50v) or q50v <= 0:
+                            ok = False
+                    if ok and rules.get("use_adaptive", True):
+                        av = float(r["adaptive"][i])
+                        if not fin(av) or av < tier["a_th"]:
+                            ok = False
+                if not ok:
+                    continue
+                ret_t = float(r["ret1"][i])
+                if ret_t >= _v4_limit_pct(code) - 0.005:
+                    continue        # 涨停无法买入
+                px_c = float(r["close"][i])
+                buy_net = px_c * (1 + cost["slip"]) * (1 + cost["commission"])
+                eq0 = cash + sum(pp["shares"] * last_close.get(c,
+                                 pp["last_px"])
+                                 for c, pp in pos.items())
+                shares = int(eq0 * tier["frac"] / buy_net / 100.0) * 100
+                if shares <= 0 or shares * buy_net > cash:
+                    continue
+                cash -= shares * buy_net
+                p = {"t_at": i, "t_in": i, "shares": shares,
+                     "buy_net": buy_net, "entry": px_c,
+                     "highest": max(px_c, float(r["high"][i])),
+                     "last_px": px_c, "entry_d": d}
+                q10a = r["q"]["10"]
+                q75a = r["q"]["75"]
+                if use_dist and fin(q10a[i]) and fin(q75a[i]):
+                    p["stop"] = p["entry"] * (1.0 + float(q10a[i]))
+                    p["target"] = p["entry"] * (1.0 + float(q75a[i]))
+                else:
+                    p["stop"] = None
+                    p["target"] = None
+                    p["atr_fallback"] = True
+                pos[code] = p
+        # ---- 收盘权益 ----
+        eq = cash + sum(pp["shares"] * last_close.get(c, pp["last_px"])
+                        for c, pp in pos.items())
+        for c, pp in pos.items():
+            if c in last_close:
+                pp["last_px"] = last_close[c]
+        eq_curve.append(eq)
+    # 期末强平（按最后收盘价+成本），使胜率/盈亏比统计完整
+    n_forced = 0
+    for code in sorted(pos):
+        pp = pos[code]
+        px = last_close.get(code, pp["last_px"])
+        net = px * (1 - cost["slip"]) * (1 - cost["commission"]
+                                         - cost["stamp"])
+        cash += pp["shares"] * net
+        trades.append({"code": code, "ret": net / pp["buy_net"] - 1.0,
+                       "pnl": pp["shares"] * (net - pp["buy_net"]),
+                       "hold": pp["t_at"] - pp["t_in"], "exit_d": cal[-1]})
+        n_forced += 1
+    m = _v4_metrics(eq_curve, cal, trades,
+                    stock_days=sum(len(r["dates"]) for r in preds))
+    m["equity"] = eq_curve
+    m["dates"] = cal
+    m["trade_list"] = trades
+    m["forced_closes"] = n_forced
+    return m
+
+
+def _v4_entry_score(preds, rules):
+    """与入场逻辑一致的 (score, label) 对（用于消融表 IC/MAE）。"""
+    xs, ys = [], []
+    use_lgbm = rules.get("use_lgbm", True)
+    adaptive_h = rules.get("adaptive_h", True)
+    for r in preds:
+        if use_lgbm:
+            if adaptive_h:
+                for i, h in enumerate(r["h_choice"]):
+                    h = int(h)
+                    am = r["ml"].get(h)
+                    ay = r["y"].get(h)
+                    if am is None or ay is None:
+                        continue
+                    xv, yv = float(am[i]), float(ay[i])
+                    if np.isfinite(xv) and np.isfinite(yv):
+                        xs.append(xv)
+                        ys.append(yv)
+            else:
+                H = int(rules.get("h_fixed", 5))
+                am, ay = r["ml"].get(H), r["y"].get(H)
+                if am is None or ay is None:
+                    continue
+                for xv, yv in zip(am, ay):
+                    if np.isfinite(xv) and np.isfinite(yv):
+                        xs.append(float(xv))
+                        ys.append(float(yv))
+        elif rules.get("use_quantile", True):
+            am, ay = r["q"]["50"], r["y"].get(5)
+            if am is None or ay is None:
+                continue
+            for xv, yv in zip(am, ay):
+                if np.isfinite(xv) and np.isfinite(yv):
+                    xs.append(float(xv))
+                    ys.append(float(yv))
+    ic = _v4_rankic(xs, ys) if xs else None
+    mae = float(np.mean([abs(x - y) for x, y in zip(xs, ys)])) if xs else None
+    return {"ic": ic, "mae": mae, "n": len(xs)}
+
+
+# ---- v4 汇总指标 / 编排器 ----
+
+def _v4_h_merge(preds, H):
+    """某 Horizon 的全样本 (pred, y) 对 + 每股IC序列。"""
+    xs, ys, ics = [], [], []
+    for r in preds:
+        am, ay = r["ml"].get(H), r["y"].get(H)
+        if am is None or ay is None:
+            continue
+        for xv, yv in zip(am, ay):
+            if np.isfinite(xv) and np.isfinite(yv):
+                xs.append(float(xv))
+                ys.append(float(yv))
+        ic = _v4_rankic(am, ay)
+        if ic is not None:
+            ics.append(ic)
+    return xs, ys, ics
+
+
+def _v4_score_pairs(preds, getter):
+    """逐日取 score 与当日所选 Horizon 标签配对（getter(r,i)->float|None）。"""
+    xs, ys = [], []
+    for r in preds:
+        for i in range(len(r["dates"])):
+            xv = getter(r, i)
+            if xv is None:
+                continue
+            H = int(r["h_choice"][i])
+            ay = r["y"].get(H)
+            if ay is None:
+                continue
+            yv = float(ay[i])
+            if np.isfinite(xv) and np.isfinite(yv):
+                xs.append(xv)
+                ys.append(yv)
+    return xs, ys
+
+
+def _v4_eval(xs, ys, th=0.0):
+    """IC / MAE / 方向命中率 / 样本数。"""
+    out = {"ic": None, "mae": None, "hit": None, "n": len(xs),
+           "ic_ir": None}
+    if not xs:
+        return out
+    out["ic"] = _v4_rankic(xs, ys)
+    out["mae"] = float(np.mean([abs(x - y) for x, y in zip(xs, ys)]))
+    if out["ic"] is not None:
+        out["hit"] = float(np.mean(
+            [(x > th) == (y > 0) for x, y in zip(xs, ys)]))
+    return out
+
+
+def _v4_icir(ics):
+    if not ics:
+        return None
+    m = float(np.mean(ics))
+    s = float(np.std(ics))
+    return m / max(s, 1e-6)
+
+
+def _v4_quantile_diag(preds):
+    """Pinball Loss / 区间覆盖率 / 交叉率（vs 当日所选 Horizon 标签）。"""
+    tot = {q: [0.0, 0] for q in _V4_QTS}
+    cov = [0, 0]
+    for r in preds:
+        for i in range(len(r["dates"])):
+            H = int(r["h_choice"][i])
+            ay = r["y"].get(H)
+            if ay is None:
+                continue
+            yv = float(ay[i])
+            if not np.isfinite(yv):
+                continue
+            qv = {q: float(r["q"][str(q)][i]) for q in _V4_QTS}
+            if not all(np.isfinite(v) for v in qv.values()):
+                continue
+            for q in _V4_QTS:
+                a = yv - qv[q]
+                loss = a * (q / 100.0) if a > 0 else -a * (1 - q / 100.0)
+                tot[q][0] += loss
+                tot[q][1] += 1
+            cov[1] += 1
+            if qv[10] <= yv <= qv[90]:
+                cov[0] += 1
+    return {("pinball_%d" % q): (tot[q][0] / tot[q][1] if tot[q][1] else None)
+            for q in _V4_QTS} | {
+        "coverage_10_90": (cov[0] / cov[1]) if cov[1] else None,
+        "n": cov[1]}
+
+
+def _v4_factor_agg(preds):
+    """跨股聚合因子表：中位 train_ic / 稳定性 / 入选率 / 中位|权重|。"""
+    agg = {f: {"ic": [], "stab": [], "sel": 0, "w": [], "n": 0}
+           for f in _V4_FACTORS}
+    n_st = 0
+    for r in preds:
+        ft = r.get("factor_table")
+        if not ft:
+            continue
+        n_st += 1
+        for row in ft:
+            a = agg[row["factor"]]
+            a["n"] += 1
+            a["ic"].append(row["train_ic"])
+            a["stab"].append(row["stability"])
+            if row["selected"]:
+                a["sel"] += 1
+                a["w"].append(abs(row["weight"]))
+    out = {}
+    for f, a in agg.items():
+        if not a["n"]:
+            continue
+        out[f] = {
+            "train_ic_med": float(np.median(a["ic"])),
+            "stability_med": float(np.median(a["stab"])),
+            "sel_pct": a["sel"] / a["n"],
+            "weight_med": float(np.median(a["w"])) if a["w"] else 0.0,
+        }
+    out["_n_stocks"] = n_st
+    return out
+
+
+def _v4_baseline_ic(preds):
+    """v3.3 多维评分信号状态 pooled IC（+1/0/-1 vs 次日收益）。"""
+    xs, ys = [], []
+    for r in preds:
+        for i, d in enumerate(r["dates"]):
+            typ = r["base_sigs"].get(d)
+            if typ is None:
+                continue
+            ay = r["y"].get(1)
+            if ay is None or i + 1 >= len(r["dates"]):
+                continue
+            yv = float(ay[i])
+            if not np.isfinite(yv):
+                continue
+            xs.append(1.0 if typ == "BUY" else -1.0)
+            ys.append(yv)
+    return _v4_eval(xs, ys)
+
+
+def run_v4_research(min_bars=400, limit=0, progress=None):
+    """v4.0 全A研究：Walk-Forward 自适应ML + 三档风险回测 + 消融。
+
+    返回 report dict（同时落盘 research/v4_report.json 与
+    research/v4_factors.json）。"""
+    from concurrent.futures import ProcessPoolExecutor
+    p = progress or (lambda s: None)
+    deps = _v4_deps()
+    if np is None or deps.get("numpy") is None:
+        raise RuntimeError("v4.0 需要 numpy：pip install numpy")
+    if deps.get("sklearn") is None:
+        raise RuntimeError("v4.0 需要 scikit-learn：pip install scikit-learn")
+    p("v4.0：加载股票池与市场/行业上下文 ...")
+    with db_conn() as conn:
+        codes = [r[0] for r in conn.execute(
+            "SELECT code FROM daily_bars GROUP BY code "
+            "HAVING COUNT(*) >= ? AND (code LIKE 'sh60%' OR code LIKE 'sh68%'"
+            " OR code LIKE 'sz00%' OR code LIKE 'sz30%')",
+            (min_bars,)).fetchall()]
+        ind_of = {c: (i or "") for c, i in
+                  conn.execute("SELECT code, industry FROM stocks")}
+    if limit:
+        codes = codes[:limit]
+    # 市场/行业等权日收益（一遍扫描）
+    mkt_acc, ind_acc = {}, {}
+    prev_px = {}
+    with db_conn() as conn:
+        cur = conn.execute(
+            "SELECT code, date, close FROM daily_bars ORDER BY date")
+        for code, d, cl in cur:
+            pv = prev_px.get(code)
+            if pv and pv > 0 and cl and cl > 0:
+                r = cl / pv - 1.0
+                a = mkt_acc.get(d)
+                if a is None:
+                    mkt_acc[d] = [r, 1]
+                else:
+                    a[0] += r
+                    a[1] += 1
+                b = ind_acc.setdefault(d, {}).setdefault(
+                    ind_of.get(code, ""), [0.0, 0])
+                b[0] += r
+                b[1] += 1
+            if cl:
+                prev_px[code] = cl
+    mkt = {d: s / c for d, (s, c) in mkt_acc.items() if c}
+    ind = {d: {k: s / c for k, (s, c) in v.items() if c}
+           for d, v in ind_acc.items()}
+    del mkt_acc, ind_acc, prev_px
+
+    # ---- 分块多进程 Walk-Forward ----
+    preds = []
+    n_done = 0
+    CH = 120
+    workers = max(1, min(6, os.cpu_count() or 2))
+    p(f"v4.0：Walk-Forward 全A计算（{len(codes)}只 × {len(_V4_HORIZONS)}周期, "
+      f"{workers}进程）...")
+    with ProcessPoolExecutor(max_workers=workers,
+                             initializer=_v4_worker_init,
+                             initargs=(mkt, ind)) as ex:
+        for ci in range(0, len(codes), CH):
+            chunk = codes[ci:ci + CH]
+            bars_map = {}
+            with db_conn() as conn:
+                ph = ",".join("?" for _ in chunk)
+                rws = conn.execute(
+                    f"SELECT code,date,open,high,low,close,vol FROM ("
+                    f" SELECT *, ROW_NUMBER() OVER (PARTITION BY code "
+                    f" ORDER BY date DESC) rn FROM daily_bars "
+                    f" WHERE code IN ({ph})"
+                    f") WHERE rn<=1000 ORDER BY code, date", chunk).fetchall()
+            for c, d, o, h, l, cl, v in rws:
+                bars_map.setdefault(c, []).append(
+                    {"date": d, "open": o, "high": h, "low": l,
+                     "close": cl, "vol": v or 0.0})
+            jobs = [(c, b, ind_of.get(c, ""))
+                    for c, b in bars_map.items() if len(b) >= min_bars]
+            for res in ex.map(_v4_walkforward_one, jobs):
+                if res:
+                    preds.append(res)
+                    n_done += 1
+            p(f"v4.0 进度 {min(ci + CH, len(codes))}/{len(codes)}"
+              f"（有效 {n_done}）")
+    del mkt, ind
+    if not preds:
+        raise RuntimeError("v4.0：无有效股票（缓存不足或依赖缺失）")
+
+    # ---- Horizon 实验 ----
+    p("v4.0：汇总 Horizon / 模型 / 分位数 指标 ...")
+    horizon = {}
+    h_dist = {}
+    for H in _V4_HORIZONS:
+        xs, ys, ics = _v4_h_merge(preds, H)
+        e = _v4_eval(xs, ys)
+        e["ic_ir"] = _v4_icir(ics)
+        horizon[str(H)] = e
+    for r in preds:
+        for h in r["h_choice"]:
+            h_dist[int(h)] = h_dist.get(int(h), 0) + 1
+    horizon["h_choice_dist"] = {str(k): v for k, v in
+                                sorted(h_dist.items())}
+
+    # ---- 模型比较（vs 当日所选 Horizon 标签） ----
+    def _g_ml(r, i):
+        H = int(r["h_choice"][i])
+        am = r["ml"].get(H)
+        if am is None:
+            return None
+        v = float(am[i])
+        return v if np.isfinite(v) else None
+
+    def _g(name):
+        if name == "ml":
+            return _g_ml
+        key = {"p_up": "p_up", "adaptive": "adaptive",
+               "l1_up": "l1_up", "l1_ret": "l1_ret",
+               "q50": ("q", "50")}.get(name)
+
+        def g(r, i):
+            if isinstance(key, tuple):
+                arr = r["q"].get(key[1])
+            else:
+                arr = r.get(name)
+            if arr is None:
+                return None
+            v = float(arr[i])
+            return v if np.isfinite(v) else None
+        return g
+
+    models = {}
+    for name, th in (("ml", 0.0), ("q50", 0.0), ("adaptive", 0.0),
+                     ("p_up", 0.5), ("l1_up", 0.5), ("l1_ret", 0.0)):
+        xs, ys = _v4_score_pairs(preds, _g(name))
+        models[name] = _v4_eval(xs, ys, th=th)
+    # 概率类模型的 MAE（|p-收益|）无意义，置空
+    models["p_up"]["mae"] = None
+    models["l1_up"]["mae"] = None
+    models["baseline_composite"] = _v4_baseline_ic(preds)
+
+    # ---- Quantile 诊断 / 过拟合检查 ----
+    qdiag = _v4_quantile_diag(preds)
+    cross = [r["q_cross"] for r in preds if r.get("q_cross") is not None]
+    qdiag["crossing_raw_med"] = float(np.median(cross)) if cross else None
+    ins = [r["ins_ic"] for r in preds if r.get("ins_ic") is not None]
+    overfit = {
+        "lgbm_train_ic_med": float(np.median(ins)) if ins else None,
+        "lgbm_test_ic": models["ml"]["ic"],
+        "flag": None, "note": "Train IC 显著高于 Test IC → 过拟合标记",
+    }
+    if overfit["lgbm_train_ic_med"] is not None \
+            and models["ml"]["ic"] is not None:
+        overfit["flag"] = bool(
+            overfit["lgbm_train_ic_med"] - models["ml"]["ic"] > 0.15)
+    feat_imp_top = {}
+    for r in preds:
+        if r.get("feat_imp"):
+            for f, g in r["feat_imp"]:
+                feat_imp_top[f] = feat_imp_top.get(f, 0.0) + float(g)
+    feat_imp_top = dict(sorted(feat_imp_top.items(), key=lambda x: -x[1]))
+
+    # ---- 因子聚合 ----
+    factors = _v4_factor_agg(preds)
+
+    # ---- 组合回测：Baseline / Adaptive / Full 三档 + 消融 ----
+    # 组合回测用时间对齐子样本：测试段结束距全局最新日 ≤45 个自然日，
+    # 避免退市股旧窗口拉长日历（退市股仍参与全部 IC/模型统计）。
+    # 注意：对齐隐含幸存者偏差，结论解读时须考虑。
+    import datetime as _dt4
+    last_d = max(r["dates"][-1] for r in preds)
+    _ld = _dt4.date.fromisoformat(last_d)
+    preds_bt = [r for r in preds
+                if (_ld - _dt4.date.fromisoformat(r["dates"][-1])).days <= 45]
+    p("v4.0：组合级回测（三档风险 × 策略 × 消融，"
+      f"{len(preds_bt)}/{len(preds)} 只时间对齐）...")
+    sims = {}
+    tier_of_mode = {"保守": "保守", "稳健": "平衡", "激进": "激进"}
+    for mode in ("保守", "稳健", "激进"):
+        rules = {"mode": "baseline", "use_logistic": False,
+                 "use_adaptive": False, "use_lgbm": False,
+                 "use_quantile": False, "use_dist_exit": False}
+        sims["baseline:" + mode] = _v4_portfolio_sim(
+            preds_bt, _V4_TIERS[tier_of_mode[mode]], rules)
+    for tn in ("保守", "平衡", "激进"):
+        rules = {"mode": "adaptive", "use_logistic": False,
+                 "use_lgbm": False, "use_quantile": False,
+                 "use_dist_exit": False}
+        sims["adaptive:" + tn] = _v4_portfolio_sim(
+            preds_bt, _V4_TIERS[tn], rules)
+        sims["full:" + tn] = _v4_portfolio_sim(
+            preds_bt, _V4_TIERS[tn], {"mode": "full"})
+    for vname, vr in _V4_VARIANTS.items():
+        for tn in ("保守", "平衡", "激进"):
+            rules = {"mode": "full"}
+            rules.update(vr)
+            sims["abl:%s:%s" % (vname, tn)] = _v4_portfolio_sim(
+                preds_bt, _V4_TIERS[tn], rules)
+
+    def _strip(m):
+        return {k: v for k, v in m.items()
+                if k not in ("equity", "dates", "trade_list")}
+
+    strategies = {k: _strip(v) for k, v in sims.items()
+                  if not k.startswith("abl:")}
+    ablation = {}
+    for vname, vr in _V4_VARIANTS.items():
+        rules = {"mode": "full"}
+        rules.update(vr)
+        ic_m = _v4_entry_score(preds, rules)
+        ablation[vname] = {
+            "tier": {tn: _strip(sims["abl:%s:%s" % (vname, tn)])
+                     for tn in ("保守", "平衡", "激进")},
+            "entry_score_ic": ic_m["ic"],
+            "entry_score_mae": ic_m["mae"],
+        }
+
+    # ---- 元信息 / 泄漏检查 ----
+    all_dates = [d for r in preds for d in (r["dates"][0], r["dates"][-1])]
+    spans = [len(r["dates"]) for r in preds]
+    report = {
+        "meta": {
+            "ts": time.strftime("%Y-%m-%d %H:%M"),
+            "deps": deps,
+            "n_codes_pool": len(codes),
+            "n_valid": len(preds),
+            "n_valid_bt": len(preds_bt),
+            "bt_align_note": "组合回测使用测试段结束距最新日≤45自然日的"
+                             "时间对齐子样本（隐含幸存者偏差，如实记录）",
+            "min_bars": min_bars,
+            "date_min": min(all_dates),
+            "date_max": max(all_dates),
+            "span_med": int(np.median(spans)),
+            "fold": _V4_FOLD,
+            "warmup": _V4_WARMUP,
+            "train_min": _V4_TRAIN_MIN,
+            "cost": _V4_COST,
+            "capital": _V4_CAPITAL,
+            "lgbm_params": _V4_LGBM,
+            "note_data": "回测范围为本地缓存可用数据（部分缓存），"
+                         "非全市场完整覆盖；见 n_codes_pool/n_valid。",
+        },
+        "horizon": horizon,
+        "models": models,
+        "quantile": qdiag,
+        "overfit": overfit,
+        "feat_imp_top": feat_imp_top,
+        "factors": factors,
+        "strategies": strategies,
+        "ablation": ablation,
+        "leakage_check": [
+            "特征仅用 T 日及以前数据（形态匹配样本窗口结束于 T-W 之前）",
+            "标签 Close[T+H]/Close[T]-1 仅作训练目标，不进特征",
+            "StandardScaler/Lasso筛选/Horizon选择均只在训练段完成",
+            "Walk-Forward 扩展窗：每折仅用折前数据训练，折间不重叠",
+            "LightGBM 超参先验固定，未用 Test 调参",
+            "三档风险为同一模型输出上的决策层参数，未分别训练",
+            "组合回测统一初始资金/手续费/滑点/成交时点/涨跌停/停牌规则",
+        ],
+    }
+
+    # ---- 落盘 ----
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "research")
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+
+        def _jb(o):
+            if isinstance(o, dict):
+                return {str(k): _jb(v) for k, v in o.items()}
+            if isinstance(o, (list, tuple)):
+                return [_jb(v) for v in o]
+            if isinstance(o, (np.floating, np.integer)):
+                return o.item()
+            if isinstance(o, float) and not np.isfinite(o):
+                return None
+            if isinstance(o, np.bool_):
+                return bool(o)
+            return o
+
+        with open(os.path.join(out_dir, "v4_report.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(_jb(report), f, ensure_ascii=False, indent=1)
+        with open(os.path.join(out_dir, "v4_factors.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(_jb({r["code"]: r["factor_table"] for r in preds
+                           if r.get("factor_table")}),
+                      f, ensure_ascii=False, indent=1)
+        p("v4.0：报告已写入 research/v4_report.json")
+    except Exception:
+        log.exception("v4 报告落盘失败")
+    return report
+
+
+def _v4_print_report(r):
+    """控制台摘要（CLI --v4）。"""
+    m = r["meta"]
+    print("=" * 76)
+    print(f"v4.0 全A研究  {m['ts']}  股票池 {m['n_codes_pool']} 只 / "
+          f"有效 {m['n_valid']} 只  "
+          f"区间 {m['date_min']} ~ {m['date_max']}（中位{m['span_med']}日）")
+    print(f"依赖: numpy={m['deps'].get('numpy')} "
+          f"sklearn={m['deps'].get('sklearn')} "
+          f"lightgbm={m['deps'].get('lightgbm')}")
+    print("-" * 76)
+    print("Horizon 实验（LightGBM 预测 vs 真实收益）")
+    print(f"{'H':>4}{'IC':>9}{'IC_IR':>8}{'MAE':>9}{'方向命中':>9}{'样本':>9}")
+    for H in ("1", "5", "10"):
+        e = r["horizon"].get(H, {})
+        f = lambda v, k=100: "-" if v is None else f"{v*k:+.3f}"
+        print(f"{H:>4}{f(e.get('ic'), 1):>9}{f(e.get('ic_ir'), 1):>8}"
+              f"{f(e.get('mae'), 1):>9}"
+              f"{f(e.get('hit')):>9}{e.get('n', 0):>9}")
+    print("Horizon 自适应选择分布: " + str(r["horizon"].get("h_choice_dist")))
+    print("-" * 76)
+    print("模型比较（vs 当日所选 Horizon 真实收益）")
+    print(f"{'模型':<20}{'IC':>9}{'MAE':>9}{'方向命中':>9}{'样本':>9}")
+    NM = {"ml": "LightGBM", "q50": "Quantile Q50", "adaptive": "Lasso得分",
+          "p_up": "Logistic p_up", "l1_up": "L1形态up_prob",
+          "l1_ret": "L1相似样本收益", "baseline_composite": "v3.3多维评分"}
+    for k, e in r["models"].items():
+        f = lambda v, k2=100: "-" if v is None else f"{v*k2:+.3f}"
+        print(f"{NM.get(k, k):<20}{f(e.get('ic'), 1):>9}"
+              f"{f(e.get('mae'), 1):>9}{f(e.get('hit')):>9}{e['n']:>9}")
+    q = r["quantile"]
+    print("-" * 76)
+    print("Quantile 诊断: " + "  ".join(
+        f"P{qk.split('_')[1]}={v:.4f}" if v is not None else "-"
+        for qk, v in q.items() if qk.startswith("pinball"))
+        + f"  覆盖率[10,90]={q.get('coverage_10_90')}"
+        + f"  原始交叉率={q.get('crossing_raw_med')}")
+    o = r["overfit"]
+    print(f"LightGBM 过拟合检查: Train IC 中位 {o['lgbm_train_ic_med']} "
+          f"vs Test IC {o['lgbm_test_ic']} → "
+          f"{'⚠️疑似过拟合' if o['flag'] else '未见明显过拟合'}")
+    print("-" * 76)
+    print("因子有效性（跨股聚合）")
+    print(f"{'因子':<10}{'IC中位':>9}{'稳定性':>8}{'入选率':>8}{'中位|权重|':>10}")
+    for f_, a in r["factors"].items():
+        if f_.startswith("_"):
+            continue
+        print(f"{f_:<10}{a['train_ic_med']:+9.3f}{a['stability_med']:8.2f}"
+              f"{a['sel_pct']*100:7.0f}%{a['weight_med']:10.4f}")
+    print("-" * 76)
+    print("组合回测（统一成本：滑点0.1%/佣金万3/印花税千1；初始100万）")
+    print(f"{'策略':<24}{'年化':>9}{'回撤':>9}{'Calmar':>8}{'Sharpe':>8}"
+          f"{'胜率':>7}{'盈亏比':>7}{'交易':>6}{'均持仓':>7}")
+    for k, v in r["strategies"].items():
+        g = lambda v_, d=1: "-" if v_ is None else f"{v_*100:+.{d}f}%"
+        g2 = lambda v_: "-" if v_ is None else f"{v_:.2f}"
+        hold = "-" if v["avg_hold"] is None else f"{v['avg_hold']:.1f}"
+        print(f"{k:<24}{g(v['ann']):>9}{g(v['mdd']):>9}"
+              f"{g2(v['calmar']):>8}{g2(v['sharpe']):>8}"
+              f"{g(v['winrate']):>7}{g2(v['pf']):>7}{v['trades']:>6}"
+              f"{hold:>7}")
+    print("-" * 76)
+    print("消融实验（平衡档；IC=该变体入场分数 pooled IC）")
+    print(f"{'变体':<28}{'年化':>9}{'回撤':>9}{'Calmar':>8}{'Sharpe':>8}"
+          f"{'胜率':>7}{'交易':>6}{'IC':>8}")
+    for vn, a in r["ablation"].items():
+        v = a["tier"]["平衡"]
+        g = lambda v_, d=1: "-" if v_ is None else f"{v_*100:+.{d}f}%"
+        g2 = lambda v_: "-" if v_ is None else f"{v_:.2f}"
+        ic = a.get("entry_score_ic")
+        print(f"{vn:<28}{g(v['ann']):>9}{g(v['mdd']):>9}"
+              f"{g2(v['calmar']):>8}{g2(v['sharpe']):>8}{g(v['winrate']):>7}"
+              f"{v['trades']:>6}{('-' if ic is None else f'{ic:+.3f}'):>8}")
+    print("=" * 76)
+    print("注：全部为历史统计研究，不构成投资建议。")
+
 # ==================== 以下为 CLI 专属 ====================
 
 def build_payload(full, res):
@@ -4919,6 +6147,16 @@ def main():
     argv = [a for a in argv if a != "--clean"]
     do_research = "--research" in argv
     argv = [a for a in argv if a != "--research"]
+    do_v4 = "--v4" in argv
+    argv = [a for a in argv if a != "--v4"]
+    v4_limit = 0
+    if "--v4-limit" in argv:
+        _i = argv.index("--v4-limit")
+        try:
+            v4_limit = int(argv[_i + 1])
+            del argv[_i:_i + 2]
+        except (ValueError, IndexError):
+            del argv[_i]
     if do_backfill and True:
         backfill_full_market(progress=print)
         if not argv:
@@ -4952,6 +6190,11 @@ def main():
         print("注：IC=信号状态与次日收益的spearman相关(跨股中位)；"
               "胜率/年化/回撤为每股事件回测后跨股中位（含样本内成分，"
               "实际选策略请用消融的训练/验证口径）")
+        if not argv:
+            return
+    if do_v4 and True:
+        r = run_v4_research(limit=v4_limit, progress=print)
+        _v4_print_report(r)
         if not argv:
             return
     if do_refresh and True:
