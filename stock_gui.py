@@ -183,6 +183,7 @@ class CFG:
         "形态": 1.2,        # L1形态上行概率（IC 0.265，全A实证最强）
         "爆发力": 1.0,      # 20日动量（10%~35%强势区加分，>35%过热减分：bias20 极端延伸 IC 为负）
         "量能": 0.9,        # 量能扩张（5日均量/20日均量，突破期特征）
+        "板块": 1.0,        # 板块轮动（行业5日收益强势/前20%领先，v4.0.2 全A实证 Rot 变体显著增益）
         "筹码": 0.8,
         "布林带": 0.8,      # 均值回归维度，震荡市才准，降权
         "ADX": 0.8,         # 趋势强度过滤器维度
@@ -2430,13 +2431,54 @@ def _l1_up_prob_last(rows):
     return ups / tot
 
 
-def daily_pick_score(rows):
+def _picks_ind_ctx(days=14):
+    """最新行业5日等权收益（板块轮动荐股用）。
+    返回 (map={industry: ret5}, med=全行业中位数, lead=前20%行业集合)。"""
+    with db_conn() as conn:
+        dates = [r[0] for r in conn.execute(
+            "SELECT DISTINCT date FROM daily_bars ORDER BY date DESC LIMIT ?",
+            (days + 6,))]
+        if len(dates) < 7:
+            return {}, 0.0, set()
+        ind_of = {c: (i or "") for c, i in
+                  conn.execute("SELECT code, industry FROM stocks")}
+        acc = {}
+        for c, d, cl in conn.execute(
+                "SELECT code, date, close FROM daily_bars "
+                "WHERE date >= ? AND date <= ? ORDER BY code, date",
+                (min(dates), dates[0])):
+            acc.setdefault(c, []).append((d, cl))
+    latest = dates[0]
+    rets = {}
+    for c, seq in acc.items():
+        dd = [x[0] for x in seq]
+        if latest not in dd:
+            continue
+        k = dd.index(latest)
+        if k < 5:
+            continue
+        p0, p5 = seq[k][1], seq[k - 5][1]
+        x = ind_of.get(c, "")
+        if p0 and p5 and p0 > 0 and p5 > 0 and x:
+            rets.setdefault(x, []).append(p0 / p5 - 1.0)
+    m = {x: sum(v) / len(v) for x, v in rets.items() if v}
+    vals = sorted(m.values())
+    med = vals[len(vals) // 2] if vals else 0.0
+    lead = set()
+    if m:
+        srt = sorted(m.items(), key=lambda kv: -kv[1])
+        lead = {x for x, _ in srt[:max(1, len(srt) // 5)]}
+    return m, med, lead
+
+
+def daily_pick_score(rows, ind_ctx=None):
     """对最新一根K线做多维打分（与买卖点信号同构，权重同 CFG.IND_W）。
     v4.0.1 荐股优化（依据 v3.3/v4 全A实证，定位"以小博大"）：
     - RSI 改动量口径：超卖反弹假设不成立（反向状态 IC -0.098，仅13.8%个股为正），
       超卖不再加分，强势状态加分；
     - 新增 MA20/60 趋势维度（IC 0.228）与 L1 形态上行概率维度（IC 0.265）；
     - 新增爆发力（20日动量，10%~35%强势区加分、>35%过热减分）与量能扩张维度；
+    - ind_ctx 非 None 时新增板块轮动维度（行业5日收益强势/前20%领先）；
     - 返回第4元素 gates：{"ma_trend": ±2/0} 供 daily_picks 做空头趋势闸门。
     返回 (score, reasons, band_fit_score, gates)。"""
     n = len(rows)
@@ -2525,6 +2567,14 @@ def daily_pick_score(rows):
         v5m = sum(vols_d[max(0, i - 4):i + 1]) / max(1, min(5, i + 1))
         if v20m > 0 and v5m / v20m > 1.5 and c > cp:
             _wadd("量能", 1, "量能扩张")
+    # 板块轮动：行业5日收益强势 / 前20%领先
+    if ind_ctx:
+        r5 = ind_ctx.get("r5")
+        if r5 is not None:
+            if r5 > ind_ctx.get("med", 0.0):
+                _wadd("板块", 1, "板块强势")
+            if ind_ctx.get("lead"):
+                _wadd("板块", 1, "板块前20%")
     try:
         # 只用尾部160根算筹码快照：全量算1600只需数分钟且饿死GIL卡界面
         snap = chip_snapshots(rows[-160:], tail=1).get(rows[i]["date"])
@@ -2569,9 +2619,12 @@ def daily_picks(progress=None, top_n=20, min_bars=120):
     with db_conn() as conn:
         names = {r[0]: r[1] for r in conn.execute(
             "SELECT code, name FROM stocks").fetchall()}
+        ind_of = {c: (i or "") for c, i in
+                  conn.execute("SELECT code, industry FROM stocks")}
         codes = [r[0] for r in conn.execute(
             "SELECT code FROM daily_bars GROUP BY code "
             "HAVING COUNT(*) >= ?", (min_bars,)).fetchall()]
+    ind5_map, ind5_med, ind5_lead = _picks_ind_ctx()
     CH = 500
     cands = []
     for i in range(0, len(codes), CH):
@@ -2606,7 +2659,10 @@ def daily_picks(progress=None, top_n=20, min_bars=120):
         if time.time() - t_start > 120:
             break                     # 2分钟硬熔断：宁可少扫不卡界面
         try:
-            r = daily_pick_score(rws[-400:])
+            _ic = ind_of.get(code, "")
+            r = daily_pick_score(rws[-400:], ind_ctx={
+                "r5": ind5_map.get(_ic), "med": ind5_med,
+                "lead": _ic in ind5_lead})
         except Exception:
             continue
         if r is None:
@@ -4729,6 +4785,35 @@ def _v4_factor_matrix(bars, industry):
     return F, aux
 
 
+def _v4_mkt_ind_ctx(ind_of):
+    """市场/行业等权日收益（一遍扫描全库）：
+    返回 (mkt={date: ret}, ind={date: {industry: ret}})。"""
+    mkt_acc, ind_acc, prev_px = {}, {}, {}
+    with db_conn() as conn:
+        cur = conn.execute(
+            "SELECT code, date, close FROM daily_bars ORDER BY date")
+        for code, d, cl in cur:
+            pv = prev_px.get(code)
+            if pv and pv > 0 and cl and cl > 0:
+                r = cl / pv - 1.0
+                a = mkt_acc.get(d)
+                if a is None:
+                    mkt_acc[d] = [r, 1]
+                else:
+                    a[0] += r
+                    a[1] += 1
+                b = ind_acc.setdefault(d, {}).setdefault(
+                    ind_of.get(code, ""), [0.0, 0])
+                b[0] += r
+                b[1] += 1
+            if cl:
+                prev_px[code] = cl
+    mkt = {d: s / c for d, (s, c) in mkt_acc.items() if c}
+    ind = {d: {k: s / c for k, (s, c) in v.items() if c}
+           for d, v in ind_acc.items()}
+    return mkt, ind
+
+
 def _v4_walkforward_one(job):
     """多进程 worker：单股 Walk-Forward 训练+预测（顶层函数可 pickle）。"""
     code, bars, industry = job
@@ -5046,6 +5131,12 @@ _V4_VARIANTS = {
     "Dist+Reentry+Cd5": {"exit_mode": "dist", "reentry_tier": True,
                          "cooldown": 5, "min_hold": 5},
     "Hybrid (v4.0.1)": {"exit_mode": "hybrid"},   # 隔离默认 dist vs hybrid
+    # 板块轮动（行业5日收益动量门槛）：
+    "Rot-Top30": {"rot_top": 0.70},               # 只买行业强度前30%的个股
+    "Rot-Top50": {"rot_top": 0.50},
+    "Rot-Strong": {"rot_strong": True},           # 只买跑赢大盘的行业
+    "Rot-T10only": {"h_only": 10, "cooldown": 5, "min_hold": 5,
+                    "rot_top": 0.70},             # T10王牌+板块轮动叠加
 }
 
 
@@ -5231,6 +5322,13 @@ def _v4_entry_mask(M, rules, tier):
             h_only = rules.get("h_only")        # 只交易指定 Horizon（如 T+10）
             if h_only:
                 ok &= (M["h_choice"] == int(h_only))
+            rot_top = rules.get("rot_top")      # 板块轮动：行业5日收益排名前 N%
+            if rot_top and "ind_rank5" in M:
+                with np.errstate(invalid="ignore"):
+                    ok &= (M["ind_rank5"] >= float(rot_top))
+            if rules.get("rot_strong") and "ind5" in M and "mkt5" in M:
+                with np.errstate(invalid="ignore"):
+                    ok &= (M["ind5"] > M["mkt5"])   # 行业跑赢大盘
         ok &= ~M["limit_up"]
     return ok & M["has_bar"]
 
@@ -5257,7 +5355,71 @@ def _v4_entry_ok_cell(M, ks, t, tier, rules):
     h_only = rules.get("h_only")
     if h_only and M["h_choice"][ks, t] != int(h_only):
         return False
+    rot_top = rules.get("rot_top")
+    if rot_top and "ind_rank5" in M:
+        v = M["ind_rank5"][ks, t]
+        if not np.isfinite(v) or v < float(rot_top):
+            return False
+    if rules.get("rot_strong") and "ind5" in M and "mkt5" in M:
+        if not (M["ind5"][ks, t] > M["mkt5"][ks, t]):
+            return False
     return True
+
+
+def _v4_attach_rotation(M, cal, codes_s, ind_of, mkt, ind):
+    """往堆叠矩阵注入板块轮动上下文：
+    ind_rank5（行业5日收益当日横截面百分位 0~1）、ind5、mkt5。"""
+    ind_names = [ind_of.get(c, "") for c in codes_s]
+    uniq = sorted({x for x in ind_names if x})
+    if not uniq:
+        return
+    jdx = {x: j for j, x in enumerate(uniq)}
+    didx = {d: k for k, d in enumerate(cal)}
+    IR = np.zeros((len(cal), len(uniq)))
+    CNT = np.zeros((len(cal), len(uniq)))
+    for d, dmap in ind.items():
+        k = didx.get(d)
+        if k is None:
+            continue
+        for x, r in dmap.items():
+            j = jdx.get(x)
+            if j is not None:
+                IR[k, j] = r
+                CNT[k, j] = 1.0
+    c = np.cumsum(IR, 0)
+    cc = np.cumsum(CNT, 0)
+    S5 = c.copy()
+    S5[5:] -= c[:-5]
+    N5 = cc.copy()
+    N5[5:] -= cc[:-5]
+    R5 = np.where(N5 > 0, S5 / np.maximum(N5, 1.0), np.nan)
+    marr = np.array([mkt.get(d, np.nan) for d in cal], float)
+    m0 = np.where(np.isfinite(marr), marr, 0.0)
+    cm = np.cumsum(m0)
+    MS5 = cm.copy()
+    MS5[5:] -= cm[:-5]
+    mn = np.isfinite(marr).astype(float)
+    ccn = np.cumsum(mn)
+    NN5 = ccn.copy()
+    NN5[5:] -= ccn[:-5]
+    MR5 = np.where(NN5 > 0, MS5 / np.maximum(NN5, 1.0), np.nan)
+    RANK = np.full(R5.shape, np.nan)
+    for k in range(R5.shape[0]):
+        row = R5[k]
+        m = np.isfinite(row)
+        n = int(m.sum())
+        if n >= 3:
+            v = row[m]
+            RANK[k, m] = v.argsort().argsort() / max(n - 1, 1)
+    ns, nc = M["close"].shape
+    M["ind_rank5"] = np.full((ns, nc), np.nan)
+    M["ind5"] = np.full((ns, nc), np.nan)
+    M["mkt5"] = np.broadcast_to(MR5[None, :], (ns, nc)).copy()
+    for k, x in enumerate(ind_names):
+        j = jdx.get(x)
+        if j is not None:
+            M["ind_rank5"][k] = RANK[:, j]
+            M["ind5"][k] = R5[:, j]
 
 
 def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
@@ -5477,34 +5639,9 @@ def run_v4_research(min_bars=400, limit=0, progress=None):
         except Exception:
             log.exception("v4 预测缓存读取失败（忽略，重新计算）")
             preds = None
+    # 市场/行业等权日收益（一遍扫描；无论命中缓存与否都要——板块轮动门槛用）
+    mkt, ind = _v4_mkt_ind_ctx(ind_of)
     while preds is None:            # 未命中缓存：完整重算（最多执行一次）
-        mkt_acc, ind_acc = {}, {}
-        # 市场/行业等权日收益（一遍扫描）
-        prev_px = {}
-        with db_conn() as conn:
-            cur = conn.execute(
-                "SELECT code, date, close FROM daily_bars ORDER BY date")
-            for code, d, cl in cur:
-                pv = prev_px.get(code)
-                if pv and pv > 0 and cl and cl > 0:
-                    r = cl / pv - 1.0
-                    a = mkt_acc.get(d)
-                    if a is None:
-                        mkt_acc[d] = [r, 1]
-                    else:
-                        a[0] += r
-                        a[1] += 1
-                    b = ind_acc.setdefault(d, {}).setdefault(
-                        ind_of.get(code, ""), [0.0, 0])
-                    b[0] += r
-                    b[1] += 1
-                if cl:
-                    prev_px[code] = cl
-        mkt = {d: s / c for d, (s, c) in mkt_acc.items() if c}
-        ind = {d: {k: s / c for k, (s, c) in v.items() if c}
-               for d, v in ind_acc.items()}
-        del mkt_acc, ind_acc, prev_px
-
         # ---- 分块多进程 Walk-Forward ----
         preds = []
         n_done = 0
@@ -5538,7 +5675,6 @@ def run_v4_research(min_bars=400, limit=0, progress=None):
                         n_done += 1
                 p(f"v4.0 进度 {min(ci + CH, len(codes))}/{len(codes)}"
                   f"（有效 {n_done}）")
-        del mkt, ind
         if not preds:
             raise RuntimeError("v4.0：无有效股票（缓存不足或依赖缺失）")
         try:
@@ -5555,6 +5691,7 @@ def run_v4_research(min_bars=400, limit=0, progress=None):
     p("v4.0：汇总 Horizon / 模型 / 分位数 指标 ...")
     mats = _v4_stack(preds)
     cal, M, codes_s = mats
+    _v4_attach_rotation(M, cal, codes_s, ind_of, mkt, ind)
 
     # Horizon 实验（矩阵向量化 + 逐股IC序列）
     horizon = {}
@@ -5622,6 +5759,7 @@ def run_v4_research(min_bars=400, limit=0, progress=None):
     rows_bt = [k for k, r in enumerate(preds)
                if (_ld - _dt4.date.fromisoformat(r["dates"][-1])).days <= 45]
     mats_bt = _v4_stack_subset([preds[k] for k in rows_bt])
+    _v4_attach_rotation(mats_bt[1], mats_bt[0], mats_bt[2], ind_of, mkt, ind)
     p("v4.0：组合级回测（三档风险 × 策略 × 消融，"
       f"{len(rows_bt)}/{len(preds)} 只时间对齐）...")
     sims = {}
