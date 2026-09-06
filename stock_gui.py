@@ -181,6 +181,8 @@ class CFG:
         "MA20": 1.0,
         "MA趋势": 1.2,      # MA20/60趋势状态（v3.3全A实证 IC 0.228，最强规则信号）
         "形态": 1.2,        # L1形态上行概率（IC 0.265，全A实证最强）
+        "爆发力": 1.0,      # 20日动量（10%~35%强势区加分，>35%过热减分：bias20 极端延伸 IC 为负）
+        "量能": 0.9,        # 量能扩张（5日均量/20日均量，突破期特征）
         "筹码": 0.8,
         "布林带": 0.8,      # 均值回归维度，震荡市才准，降权
         "ADX": 0.8,         # 趋势强度过滤器维度
@@ -2430,11 +2432,13 @@ def _l1_up_prob_last(rows):
 
 def daily_pick_score(rows):
     """对最新一根K线做多维打分（与买卖点信号同构，权重同 CFG.IND_W）。
-    v4.0.1 荐股优化（依据 v3.3/v4 全A实证）：
+    v4.0.1 荐股优化（依据 v3.3/v4 全A实证，定位"以小博大"）：
     - RSI 改动量口径：超卖反弹假设不成立（反向状态 IC -0.098，仅13.8%个股为正），
       超卖不再加分，强势状态加分；
-    - 新增 MA20/60 趋势维度（IC 0.228）与 L1 形态上行概率维度（IC 0.265）。
-    返回 (score, reasons, band_fit_score)。"""
+    - 新增 MA20/60 趋势维度（IC 0.228）与 L1 形态上行概率维度（IC 0.265）；
+    - 新增爆发力（20日动量，10%~35%强势区加分、>35%过热减分）与量能扩张维度；
+    - 返回第4元素 gates：{"ma_trend": ±2/0} 供 daily_picks 做空头趋势闸门。
+    返回 (score, reasons, band_fit_score, gates)。"""
     n = len(rows)
     if n < 60:
         return None
@@ -2495,12 +2499,32 @@ def daily_pick_score(rows):
         elif c < ma20 and ma20 < ma20p:
             _wadd("MA20", -1)
     ma60, ma60p = mas[60][i], mas[60][i - 1]
+    ma_trend = 0
     if ma20 and ma20p and ma60 and ma60p:
         # v3.3 全A实证：MA20/60趋势状态 IC 0.228（87%个股为正）
         if c > ma20 > ma60 and ma20 > ma20p:
+            ma_trend = 2
             _wadd("MA趋势", 2, "MA20/60多头趋势")
         elif c < ma20 < ma60 and ma20 < ma20p:
+            ma_trend = -2
             _wadd("MA趋势", -2, "MA20/60空头趋势")
+    # 爆发力：20日动量（以小博大核心；极端过热反向，bias20 极端延伸 IC 为负）
+    if i >= 20 and closes[i - 20]:
+        c20 = c / closes[i - 20] - 1.0
+        if 0.10 <= c20 < 0.35:
+            _wadd("爆发力", 2, "20日强势+%.0f%%" % (c20 * 100))
+        elif 0.05 <= c20 < 0.10:
+            _wadd("爆发力", 1, "20日强势+%.0f%%" % (c20 * 100))
+        elif c20 >= 0.35:
+            _wadd("爆发力", -2, "20日过热+%.0f%%" % (c20 * 100))
+        elif c20 <= -0.15:
+            _wadd("爆发力", -1, "20日弱势%.0f%%" % (c20 * 100))
+    # 量能扩张：5日均量显著放大且收涨（突破期特征）
+    if i >= 20:
+        v20m = sum(vols_d[i - 19:i + 1]) / 20.0
+        v5m = sum(vols_d[max(0, i - 4):i + 1]) / max(1, min(5, i + 1))
+        if v20m > 0 and v5m / v20m > 1.5 and c > cp:
+            _wadd("量能", 1, "量能扩张")
     try:
         # 只用尾部160根算筹码快照：全量算1600只需数分钟且饿死GIL卡界面
         snap = chip_snapshots(rows[-160:], tail=1).get(rows[i]["date"])
@@ -2534,7 +2558,7 @@ def daily_pick_score(rows):
     except Exception:
         pass
     band = _band_fit_score(rows, mas, vr_arr)
-    return sc, reasons, band
+    return sc, reasons, band, {"ma_trend": ma_trend}
 
 
 def daily_picks(progress=None, top_n=20, min_bars=120):
@@ -2587,7 +2611,11 @@ def daily_picks(progress=None, top_n=20, min_bars=120):
             continue
         if r is None:
             continue
-        score, reasons, band = r
+        score, reasons, band, gates = r
+        if "ST" in names.get(code, "").upper():
+            continue             # ST：退市/流动性风险，以小博大不碰
+        if gates.get("ma_trend", 0) <= -2:
+            continue             # 空头趋势闸门（MA20/60趋势 IC 0.228，最强信号）
         if score < CFG.risk_params()["buy_th"]:
             continue
         chg = (rws[-1]["close"] / rws[-2]["close"] - 1) * 100 \
@@ -5009,6 +5037,11 @@ _V4_VARIANTS = {
     "Hybrid - Cooldown5": {"cooldown": 5, "min_hold": 5},  # 降频实验（全策略下有害）
     "Hybrid - T10only": {"h_only": 10, "cooldown": 5,
                          "min_hold": 5},  # 只交易 T+10+冷却：低频低回撤首选
+    # 以小博大 / 交易后升档再入场（reentry_tier 已设为 full 模式默认开）：
+    "Reentry-Off": {"reentry_tier": False},   # 隔离升档再入场的贡献
+    "TrailSlow": {"trail_slow": True},
+    "T10only+Reentry": {"h_only": 10, "cooldown": 5,
+                        "min_hold": 5, "reentry_tier": True},
 }
 
 
@@ -5198,6 +5231,31 @@ def _v4_entry_mask(M, rules, tier):
     return ok & M["has_bar"]
 
 
+def _v4_entry_ok_cell(M, ks, t, tier, rules):
+    """单格入场判定（与 _v4_entry_mask 同逻辑，供平仓后升档再入场用）。"""
+    if not M["has_bar"][ks, t] or M["limit_up"][ks, t]:
+        return False
+    if rules.get("use_logistic", True) \
+            and not (M["p_up"][ks, t] >= tier["p_th"]):
+        return False
+    if rules.get("use_lgbm", True):
+        if not (M["ml_dyn"][ks, t] >= tier["r_th"]):
+            return False
+        if rules.get("use_quantile", True) and rules.get("q50_entry", True) \
+                and not (M["q50"][ks, t] > 0):
+            return False
+    elif rules.get("use_quantile", True) \
+            and not (M["q50"][ks, t] >= tier["r_th"]):
+        return False
+    if rules.get("use_adaptive", True) \
+            and not (M["adaptive"][ks, t] >= tier["a_th"]):
+        return False
+    h_only = rules.get("h_only")
+    if h_only and M["h_choice"][ks, t] != int(h_only):
+        return False
+    return True
+
+
 def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
     """组合级事件回测（矩阵版，唯一实现）。
 
@@ -5223,6 +5281,14 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
     cd = 0 if mode == "baseline" else int(rules.get("cooldown", 0))
     mh = 0 if mode == "baseline" else int(rules.get("min_hold", 0))
     cool = {}                           # code_idx -> 最后一卖出的 t
+    # 以小博大选项：stop_q=止损参考分位(10/25, 越小越宽/越大越紧)；
+    # trail_slow=移动止盈用激进参数(触发1.05/回落10%, 让盈利跑更久)；
+    # reentry_tier=平仓后 reentry_bars 根内按更高一档阈值再入场（质量门槛替代时间门槛）
+    qstop = M["q25"] if int(rules.get("stop_q", 10)) == 25 else M["q10"]
+    trp = CFG.RISK_PARAMS["激进"] if rules.get("trail_slow") else rp
+    _strict = _V4_TIERS.get({"平衡": "保守", "激进": "平衡"}
+                            .get(rules.get("tier_name", "")))
+    re_bars = int(rules.get("reentry_bars", 8) or 8)
     cost = _V4_COST
     buy_mult = (1 + cost["slip"]) * (1 + cost["commission"])
     sell_mult = (1 - cost["slip"]) * (1 - cost["commission"]
@@ -5262,18 +5328,18 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
                         px = px_c
                         sold = True
                 else:
-                    # Q10 棘轮止损（只收紧不放宽）
+                    # Q 棘轮止损（只收紧不放宽；stop_q 可选 10/25 分位）
                     if rules.get("use_q10_stop", True):
-                        q10 = M["q10"][ks, t]
-                        if np.isfinite(q10):
+                        qs = qstop[ks, t]
+                        if np.isfinite(qs):
                             p["stop"] = max(p["stop"], p["entry"]
-                                            * (1.0 + float(q10)))
+                                            * (1.0 + float(qs)))
                     # 移动止盈棘轮：浮盈触发后随最高价上移（拉长持仓）
                     if exit_mode == "hybrid" \
                             and rules.get("use_trailing", True) \
-                            and p["highest"] > p["entry"] * rp["trail_trigger"]:
+                            and p["highest"] > p["entry"] * trp["trail_trigger"]:
                         p["stop"] = max(p["stop"],
-                                        p["highest"] * rp["trail_ratio"])
+                                        p["highest"] * trp["trail_ratio"])
                     if lo <= p["stop"]:
                         px = px_o if px_o <= p["stop"] else min(p["stop"], hi)
                         sold = True
@@ -5304,6 +5370,12 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
                     continue
                 if t - cool.get(ks, -10**9) < cd:
                     continue             # 平仓冷却，防同股频繁进出
+                if mode == "full" \
+                        and rules.get("reentry_tier", True) \
+                        and _strict is not None \
+                        and t - cool.get(ks, -10**9) < re_bars \
+                        and not _v4_entry_ok_cell(M, ks, t, _strict, rules):
+                    continue             # 交易后再入场：按更高一档信号要求
                 px_c = float(M["close"][ks, t])
                 buy_net = px_c * buy_mult
                 eq0 = cash + sum(pp["shares"] * last_px[k2]
@@ -5315,10 +5387,10 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
                 p = {"t_in": t, "shares": shares, "buy_net": buy_net,
                      "entry": px_c,
                      "highest": max(px_c, float(M["high"][ks, t]))}
-                if use_dist and np.isfinite(M["q10"][ks, t]) \
+                if use_dist and np.isfinite(qstop[ks, t]) \
                         and np.isfinite(M["q75"][ks, t]):
                     if rules.get("use_q10_stop", True):
-                        p["stop"] = p["entry"] * (1.0 + float(M["q10"][ks, t]))
+                        p["stop"] = p["entry"] * (1.0 + float(qstop[ks, t]))
                     else:
                         p["stop"] = 0.0     # 无初始止损，随棘轮/移动止盈上移
                     p["target"] = p["entry"] * (1.0 + float(M["q75"][ks, t]))
@@ -5561,10 +5633,10 @@ def run_v4_research(min_bars=400, limit=0, progress=None):
         sims["adaptive:" + tn] = _v4_portfolio_sim(
             mats_bt, _V4_TIERS[tn], rules)
         sims["full:" + tn] = _v4_portfolio_sim(
-            mats_bt, _V4_TIERS[tn], {"mode": "full"})
+            mats_bt, _V4_TIERS[tn], {"mode": "full", "tier_name": tn})
     for vname, vr in _V4_VARIANTS.items():
         for tn in ("保守", "平衡", "激进"):
-            rules = {"mode": "full"}
+            rules = {"mode": "full", "tier_name": tn}
             rules.update(vr)
             sims["abl:%s:%s" % (vname, tn)] = _v4_portfolio_sim(
                 mats_bt, _V4_TIERS[tn], rules)
