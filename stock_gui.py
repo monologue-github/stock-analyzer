@@ -4519,6 +4519,8 @@ _V4_QTS = (10, 25, 50, 75, 90)
 # 键名保留以兼容旧报告结构，数值为 0 时乘法天然退化
 _V4_COST = {"slip": 0.001, "commission": 0.0, "stamp": 0.0}
 _V4_CAPITAL = 1_000_000.0
+# 预测缓存版本：**改因子/模型/折参数代码后必须 +1**，否则旧缓存被误用
+_V4_CACHE_VER = "1"
 
 # 三档风险：同一套 v4 模型输出上的不同决策层参数（不分别训练）
 # a_th 为自适应分数的 σ 阈值（训练段标准化后）
@@ -5000,9 +5002,13 @@ _V4_VARIANTS = {
     "Adaptive+Horizon+LightGBM": {"use_logistic": False,
                                   "use_dist_exit": False},
     # v4.0.1 退出结构消融（hybrid = Q10棘轮 + 移动止盈 + p_up）：
-    "Exit: Dist(v4.0)": {"exit_mode": "dist"},      # 旧纯分布退出（Q75硬目标）
+    "Exit: Dist(v4.0)": {"exit_mode": "dist", "cooldown": 0,
+                         "min_hold": 0},  # 忠实复现 v4.0 纯分布退出（含旧高频）
     "Hybrid - Trailing": {"use_trailing": False},    # 去移动止盈
     "Hybrid - Q10Stop": {"use_q10_stop": False},     # 去Q10棘轮
+    "Hybrid - Cooldown5": {"cooldown": 5, "min_hold": 5},  # 降频实验（全策略下有害）
+    "Hybrid - T10only": {"h_only": 10, "cooldown": 5,
+                         "min_hold": 5},  # 只交易 T+10+冷却：低频低回撤首选
 }
 
 
@@ -5185,6 +5191,9 @@ def _v4_entry_mask(M, rules, tier):
                 ok &= (M["q50"] >= tier["r_th"])
             if rules.get("use_adaptive", True):
                 ok &= (M["adaptive"] >= tier["a_th"])
+            h_only = rules.get("h_only")        # 只交易指定 Horizon（如 T+10）
+            if h_only:
+                ok &= (M["h_choice"] == int(h_only))
         ok &= ~M["limit_up"]
     return ok & M["has_bar"]
 
@@ -5196,6 +5205,7 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
       （v4.0.1 起佣金/印花税记 0，仅保留滑点）
     - 涨停禁买、跌停顺延；停牌持仓顺延；期末强平
     - hybrid 混合退出（默认）：Q10棘轮止损（只收紧）+ 移动止盈棘轮 + p_up 信号退出
+    - 降频开关（cooldown/min_hold）默认关闭——实测冷却损害收益；T10only 变体供低频选择
     - exit_mode="dist"：v4.0 纯分布退出（Q10棘轮 + Q75硬目标 + p_up，实测持仓被压到4.7天）
     - 对照退出：ATR止损/移动止盈（v3.3 稳健参数）
     - baseline：v3.3 多维评分信号进出
@@ -5206,6 +5216,13 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
     use_dist = rules.get("use_dist_exit", True) \
         and rules.get("use_quantile", True)
     exit_mode = rules.get("exit_mode", "hybrid")
+    # 降频开关（默认关闭！300只实测：冷却5根反而把年化 +10.6%→-3.1%——
+    # 退出后信号仍有效时快速再入场是收益来源之一，勿硬压频率）。
+    # cooldown=平仓后同股再入场冷却根数；min_hold=p_up 信号退出前最少持仓根数
+    # （止损/移动止盈不受 min_hold 限制）。baseline 信号自带冷却，不重复加。
+    cd = 0 if mode == "baseline" else int(rules.get("cooldown", 0))
+    mh = 0 if mode == "baseline" else int(rules.get("min_hold", 0))
+    cool = {}                           # code_idx -> 最后一卖出的 t
     cost = _V4_COST
     buy_mult = (1 + cost["slip"]) * (1 + cost["commission"])
     sell_mult = (1 - cost["slip"]) * (1 - cost["commission"]
@@ -5263,12 +5280,14 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
                     elif exit_mode == "dist" and hi >= p["target"]:
                         px = px_o if px_o >= p["target"] else p["target"]
                         sold = True
-                    elif rules.get("use_logistic", True) \
+                    elif t - p["t_in"] >= mh \
+                            and rules.get("use_logistic", True) \
                             and np.isfinite(M["p_up"][ks, t]) \
                             and float(M["p_up"][ks, t]) < tier["exit_p"]:
                         px = px_c
                         sold = True
             if sold:
+                cool[ks] = t
                 net = px * sell_mult
                 cash += p["shares"] * net
                 trades.append({"code": codes[ks],
@@ -5283,6 +5302,8 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
                     break
                 if ks in pos:
                     continue
+                if t - cool.get(ks, -10**9) < cd:
+                    continue             # 平仓冷却，防同股频繁进出
                 px_c = float(M["close"][ks, t])
                 buy_net = px_c * buy_mult
                 eq0 = cash + sum(pp["shares"] * last_px[k2]
@@ -5351,85 +5372,106 @@ def run_v4_research(min_bars=400, limit=0, progress=None):
                   conn.execute("SELECT code, industry FROM stocks")}
     if limit:
         codes = codes[:limit]
-    # 市场/行业等权日收益（一遍扫描）
-    mkt_acc, ind_acc = {}, {}
-    prev_px = {}
-    with db_conn() as conn:
-        cur = conn.execute(
-            "SELECT code, date, close FROM daily_bars ORDER BY date")
-        for code, d, cl in cur:
-            pv = prev_px.get(code)
-            if pv and pv > 0 and cl and cl > 0:
-                r = cl / pv - 1.0
-                a = mkt_acc.get(d)
-                if a is None:
-                    mkt_acc[d] = [r, 1]
-                else:
-                    a[0] += r
-                    a[1] += 1
-                b = ind_acc.setdefault(d, {}).setdefault(
-                    ind_of.get(code, ""), [0.0, 0])
-                b[0] += r
-                b[1] += 1
-            if cl:
-                prev_px[code] = cl
-    mkt = {d: s / c for d, (s, c) in mkt_acc.items() if c}
-    ind = {d: {k: s / c for k, (s, c) in v.items() if c}
-           for d, v in ind_acc.items()}
-    del mkt_acc, ind_acc, prev_px
-
-    # ---- 分块多进程 Walk-Forward ----
-    preds = []
-    n_done = 0
-    CH = 120
-    workers = max(1, min(8, os.cpu_count() or 2))
-    p(f"v4.0：Walk-Forward 全A计算（{len(codes)}只 × {len(_V4_HORIZONS)}周期, "
-      f"{workers}进程）...")
-    with ProcessPoolExecutor(max_workers=workers,
-                             initializer=_v4_worker_init,
-                             initargs=(mkt, ind)) as ex:
-        for ci in range(0, len(codes), CH):
-            chunk = codes[ci:ci + CH]
-            bars_map = {}
-            with db_conn() as conn:
-                ph = ",".join("?" for _ in chunk)
-                rws = conn.execute(
-                    f"SELECT code,date,open,high,low,close,vol FROM ("
-                    f" SELECT *, ROW_NUMBER() OVER (PARTITION BY code "
-                    f" ORDER BY date DESC) rn FROM daily_bars "
-                    f" WHERE code IN ({ph})"
-                    f") WHERE rn<=1000 ORDER BY code, date", chunk).fetchall()
-            for c, d, o, h, l, cl, v in rws:
-                bars_map.setdefault(c, []).append(
-                    {"date": d, "open": o, "high": h, "low": l,
-                     "close": cl, "vol": v or 0.0})
-            jobs = [(c, b, ind_of.get(c, ""))
-                    for c, b in bars_map.items() if len(b) >= min_bars]
-            for res in ex.map(_v4_walkforward_one, jobs):
-                if res:
-                    preds.append(res)
-                    n_done += 1
-            p(f"v4.0 进度 {min(ci + CH, len(codes))}/{len(codes)}"
-              f"（有效 {n_done}）")
-    del mkt, ind
-    if not preds:
-        raise RuntimeError("v4.0：无有效股票（缓存不足或依赖缺失）")
-    # preds 磁盘缓存（V4_USE_CACHE=1 时复用，跳过重训练；调参迭代用）
+    # ---- 预测缓存：Walk-Forward 结果与退出规则/成本无关，命中则跳过重训练 ----
+    # sig 绑定 股票池+min_bars+数据指纹+因子版本，任一变化自动失效；
+    # V4_NO_CACHE=1 强制重算
     _cache = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "research", "v4_preds.pkl")
-    try:
-        os.makedirs(os.path.dirname(_cache), exist_ok=True)
-        if os.environ.get("V4_USE_CACHE") == "1" and os.path.exists(_cache):
-            import pickle
-            with open(_cache, "rb") as f:
-                preds = pickle.load(f)
-            p("v4.0：已从缓存载入 %d 只股票的 Walk-Forward 预测" % len(preds))
-        else:
-            import pickle
+    _sig = None
+    preds = None
+    if os.environ.get("V4_NO_CACHE") != "1":
+        try:
+            with db_conn() as _c:
+                _dmax = _c.execute(
+                    "SELECT MAX(date) FROM daily_bars").fetchone()[0] or ""
+                _nbars = _c.execute(
+                    "SELECT COUNT(*) FROM daily_bars").fetchone()[0]
+            _sig = {"codes": codes, "min_bars": min_bars,
+                    "dmax": _dmax, "nbars": _nbars, "ver": _V4_CACHE_VER}
+            if os.path.exists(_cache):
+                import pickle as _pk
+                with open(_cache, "rb") as f:
+                    _blob = _pk.load(f)
+                if _blob.get("sig") == _sig and _blob.get("preds"):
+                    preds = _blob["preds"]
+                    p("v4.0：命中预测缓存 research/v4_preds.pkl（%d 只，"
+                      "跳过重训练）" % len(preds))
+        except Exception:
+            log.exception("v4 预测缓存读取失败（忽略，重新计算）")
+            preds = None
+    while preds is None:            # 未命中缓存：完整重算（最多执行一次）
+        mkt_acc, ind_acc = {}, {}
+        # 市场/行业等权日收益（一遍扫描）
+        prev_px = {}
+        with db_conn() as conn:
+            cur = conn.execute(
+                "SELECT code, date, close FROM daily_bars ORDER BY date")
+            for code, d, cl in cur:
+                pv = prev_px.get(code)
+                if pv and pv > 0 and cl and cl > 0:
+                    r = cl / pv - 1.0
+                    a = mkt_acc.get(d)
+                    if a is None:
+                        mkt_acc[d] = [r, 1]
+                    else:
+                        a[0] += r
+                        a[1] += 1
+                    b = ind_acc.setdefault(d, {}).setdefault(
+                        ind_of.get(code, ""), [0.0, 0])
+                    b[0] += r
+                    b[1] += 1
+                if cl:
+                    prev_px[code] = cl
+        mkt = {d: s / c for d, (s, c) in mkt_acc.items() if c}
+        ind = {d: {k: s / c for k, (s, c) in v.items() if c}
+               for d, v in ind_acc.items()}
+        del mkt_acc, ind_acc, prev_px
+
+        # ---- 分块多进程 Walk-Forward ----
+        preds = []
+        n_done = 0
+        CH = 120
+        workers = max(1, min(8, os.cpu_count() or 2))
+        p(f"v4.0：Walk-Forward 全A计算（{len(codes)}只 × {len(_V4_HORIZONS)}周期, "
+          f"{workers}进程）...")
+        with ProcessPoolExecutor(max_workers=workers,
+                                 initializer=_v4_worker_init,
+                                 initargs=(mkt, ind)) as ex:
+            for ci in range(0, len(codes), CH):
+                chunk = codes[ci:ci + CH]
+                bars_map = {}
+                with db_conn() as conn:
+                    ph = ",".join("?" for _ in chunk)
+                    rws = conn.execute(
+                        f"SELECT code,date,open,high,low,close,vol FROM ("
+                        f" SELECT *, ROW_NUMBER() OVER (PARTITION BY code "
+                        f" ORDER BY date DESC) rn FROM daily_bars "
+                        f" WHERE code IN ({ph})"
+                        f") WHERE rn<=1000 ORDER BY code, date", chunk).fetchall()
+                for c, d, o, h, l, cl, v in rws:
+                    bars_map.setdefault(c, []).append(
+                        {"date": d, "open": o, "high": h, "low": l,
+                         "close": cl, "vol": v or 0.0})
+                jobs = [(c, b, ind_of.get(c, ""))
+                        for c, b in bars_map.items() if len(b) >= min_bars]
+                for res in ex.map(_v4_walkforward_one, jobs):
+                    if res:
+                        preds.append(res)
+                        n_done += 1
+                p(f"v4.0 进度 {min(ci + CH, len(codes))}/{len(codes)}"
+                  f"（有效 {n_done}）")
+        del mkt, ind
+        if not preds:
+            raise RuntimeError("v4.0：无有效股票（缓存不足或依赖缺失）")
+        try:
+            os.makedirs(os.path.dirname(_cache), exist_ok=True)
+            import pickle as _pk
             with open(_cache, "wb") as f:
-                pickle.dump(preds, f, protocol=4)
-    except Exception:
-        log.exception("v4 preds 缓存读写失败（忽略，继续）")
+                _pk.dump({"sig": _sig, "preds": preds}, f, protocol=4)
+            p("v4.0：预测已缓存 research/v4_preds.pkl（同股票池/数据下规则迭代秒级重跑）")
+        except Exception:
+            log.exception("v4 预测缓存落盘失败（忽略）")
+        break
 
     # ---- 堆叠矩阵（一次构建，全部指标/回测共用） ----
     p("v4.0：汇总 Horizon / 模型 / 分位数 指标 ...")
