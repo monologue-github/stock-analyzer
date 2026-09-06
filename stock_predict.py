@@ -192,6 +192,8 @@ class CFG:
         "RSI": 0.9,         # 同上
         "量价": 1.0,
         "MA20": 1.0,
+        "MA趋势": 1.2,      # MA20/60趋势状态（v3.3全A实证 IC 0.228，最强规则信号）
+        "形态": 1.2,        # L1形态上行概率（IC 0.265，全A实证最强）
         "筹码": 0.8,
         "布林带": 0.8,      # 均值回归维度，震荡市才准，降权
         "ADX": 0.8,         # 趋势强度过滤器维度
@@ -2478,8 +2480,39 @@ def backtest_signals(rows, signals, rp=None):
         return None
 
 
+def _l1_up_prob_last(rows):
+    """最新一日的 L1 形态上行概率（与 v4 因子 l1_up 完全同口径，防前视）。
+    样本不足返回 None。"""
+    n = len(rows)
+    closes = [r["close"] for r in rows]
+    L = logret(closes)
+    W = W_WINDOW
+    t = n - 1
+    if len(L) < 2 * W + 3 or t - W < W:
+        return None
+    cur = znorm(L[t - W:t])
+    d_arr = _px_distances(L[:t], cur, W)    # 仅用 t 以前窗口（防前视）
+    ks = [k for k in range(len(d_arr)) if k + W <= t - W]
+    if len(ks) < 6:
+        return None
+    ks.sort(key=lambda k: d_arr[k])
+    ups = tot = 0.0
+    for k in ks[:CFG.TOPK]:
+        j = k + W
+        if j + 1 < n:
+            tot += 1.0
+            ups += 1.0 if closes[j + 1] > closes[j] else 0.0
+    if tot < 5:
+        return None
+    return ups / tot
+
+
 def daily_pick_score(rows):
     """对最新一根K线做多维打分（与买卖点信号同构，权重同 CFG.IND_W）。
+    v4.0.1 荐股优化（依据 v3.3/v4 全A实证）：
+    - RSI 改动量口径：超卖反弹假设不成立（反向状态 IC -0.098，仅13.8%个股为正），
+      超卖不再加分，强势状态加分；
+    - 新增 MA20/60 趋势维度（IC 0.228）与 L1 形态上行概率维度（IC 0.265）。
     返回 (score, reasons, band_fit_score)。"""
     n = len(rows)
     if n < 60:
@@ -2522,12 +2555,11 @@ def daily_pick_score(rows):
     else:
         _wadd("KDJ", -1)
     if r6[i] is not None and r6[i - 1] is not None:
-        if r6[i - 1] < 20 and r6[i] >= 20:
-            _wadd("RSI", 2, "RSI超卖回升")
-        elif r6[i] < 30:
-            _wadd("RSI", 1)
+        # v4.0.1：动量口径（超卖=弱势延续不加分，强势=延续加分）
+        if r6[i] < 30:
+            _wadd("RSI", -1, "RSI超卖弱势(动量)")
         elif r6[i] > 70:
-            _wadd("RSI", -1)
+            _wadd("RSI", 1, "RSI强势(动量)")
     c, cp = rows[i]["close"], rows[i - 1]["close"]
     v5 = sum(vols_d[max(0, i - 5):i]) / max(1, min(5, i))
     vr_d = vols_d[i] / v5 if v5 > 0 else 0.0
@@ -2541,6 +2573,13 @@ def daily_pick_score(rows):
             _wadd("MA20", 1)
         elif c < ma20 and ma20 < ma20p:
             _wadd("MA20", -1)
+    ma60, ma60p = mas[60][i], mas[60][i - 1]
+    if ma20 and ma20p and ma60 and ma60p:
+        # v3.3 全A实证：MA20/60趋势状态 IC 0.228（87%个股为正）
+        if c > ma20 > ma60 and ma20 > ma20p:
+            _wadd("MA趋势", 2, "MA20/60多头趋势")
+        elif c < ma20 < ma60 and ma20 < ma20p:
+            _wadd("MA趋势", -2, "MA20/60空头趋势")
     try:
         # 只用尾部160根算筹码快照：全量算1600只需数分钟且饿死GIL卡界面
         snap = chip_snapshots(rows[-160:], tail=1).get(rows[i]["date"])
@@ -2563,6 +2602,16 @@ def daily_pick_score(rows):
             _wadd("ADX", 1, "ADX趋势偏多" if a_i >= 25 else None)
         elif m_i > p_i:
             _wadd("ADX", -1)
+    try:
+        # L1 形态上行概率（v4 因子同口径，IC 0.265 全A最强）
+        p_up = _l1_up_prob_last(rows)
+        if p_up is not None:
+            if p_up >= 0.6:
+                _wadd("形态", 2, "L1形态上行%d%%" % round(p_up * 100))
+            elif p_up <= 0.4:
+                _wadd("形态", -2, "L1形态上行%d%%" % round(p_up * 100))
+    except Exception:
+        pass
     band = _band_fit_score(rows, mas, vr_arr)
     return sc, reasons, band
 
@@ -4545,7 +4594,9 @@ _V4_FOLD = 40            # Walk-Forward 折大小（交易日）
 _V4_WARMUP = 60          # 因子预热期
 _V4_TRAIN_MIN = 180      # 首折最少训练样本
 _V4_QTS = (10, 25, 50, 75, 90)
-_V4_COST = {"slip": 0.001, "commission": 0.0003, "stamp": 0.001}
+# v4.0.1：去掉佣金/印花税（记 0），只保留滑点——用户实际交易成本以滑点为主；
+# 键名保留以兼容旧报告结构，数值为 0 时乘法天然退化
+_V4_COST = {"slip": 0.001, "commission": 0.0, "stamp": 0.0}
 _V4_CAPITAL = 1_000_000.0
 
 # 三档风险：同一套 v4 模型输出上的不同决策层参数（不分别训练）
@@ -5027,186 +5078,11 @@ _V4_VARIANTS = {
     "LightGBM+Quantile": {"use_logistic": False, "use_adaptive": False},
     "Adaptive+Horizon+LightGBM": {"use_logistic": False,
                                   "use_dist_exit": False},
+    # v4.0.1 退出结构消融（hybrid = Q10棘轮 + 移动止盈 + p_up）：
+    "Exit: Dist(v4.0)": {"exit_mode": "dist"},      # 旧纯分布退出（Q75硬目标）
+    "Hybrid - Trailing": {"use_trailing": False},    # 去移动止盈
+    "Hybrid - Q10Stop": {"use_q10_stop": False},     # 去Q10棘轮
 }
-
-
-def _v4_portfolio_sim(preds, tier, rules, initial=_V4_CAPITAL):
-    """组合级事件回测。
-
-    - 信号日收盘成交（与 v3.3 同口径）；买入价 = 收盘×(1+滑点)×(1+佣金)
-    - 卖出净价 = 成交价×(1-滑点)×(1-佣金-印花税)；涨停禁买、跌停顺延
-    - 停牌日无bar → 持仓顺延
-    - 分布退出：Q10止损棘轮（只能收紧）+ Q75目标 + p_up 信号退出
-    - 对照退出：ATR止损/移动止盈（v3.3 稳健参数，防火墙/消融用）
-    - baseline 模式：v3.3 多维评分信号进出（rules 关闭全部 v4 条件）
-    """
-    rp = CFG.RISK_PARAMS["稳健"]
-    mode = rules.get("mode", "full")
-    use_dist = rules.get("use_dist_exit", True) \
-        and rules.get("use_quantile", True)
-    cost = _V4_COST
-    by_date = {}
-    for r in preds:
-        for i, d in enumerate(r["dates"]):
-            by_date.setdefault(d, []).append((r, i))
-    cal = sorted(by_date)
-    if not cal:
-        return _v4_metrics([], [], [])
-    cash = initial
-    pos = {}
-    last_close = {}
-    eq_curve = []
-    trades = []
-    fin = np.isfinite
-    for d in cal:
-        day_map = {r["code"]: (r, i) for r, i in by_date[d]}
-        for code, (r, i) in day_map.items():
-            last_close[code] = float(r["close"][i])
-        # ---- 退出（先卖后买，同 v3.3 口径）----
-        for code in sorted(pos):
-            got = day_map.get(code)
-            if got is None:
-                continue            # 停牌：持仓顺延
-            r, i = got
-            p = pos[code]
-            p["t_at"] = i
-            px_c = float(r["close"][i])
-            px_o = float(r["open"][i])
-            hi = float(r["high"][i])
-            lo = float(r["low"][i])
-            ret_t = float(r["ret1"][i])
-            lim = _v4_limit_pct(code)
-            sold = False
-            if ret_t > -(lim - 0.005):          # 跌停日无法卖出，顺延
-                if mode == "baseline" or p.get("atr_fallback") or not use_dist:
-                    # ATR止损/移动止盈（v3.3 口径）
-                    atr_t = float(r["atr"][i])
-                    if p["highest"] > p["entry"] * rp["trail_trigger"]:
-                        stop = p["highest"] * rp["trail_ratio"]
-                    else:
-                        stop = p["entry"] - rp["atr_mult"] * max(atr_t, 1e-9)
-                    if lo <= stop:
-                        px = px_o if px_o <= stop else min(stop, hi)
-                        sold = True
-                    elif mode == "baseline" \
-                            and r["base_sigs"].get(d) == "SELL":
-                        px = px_c
-                        sold = True
-                else:
-                    # 预测分布退出：Q10止损棘轮（只能收紧）+ Q75目标 + p_up
-                    q10 = float(r["q"]["10"][i])
-                    if fin(r["q"]["10"][i]):
-                        p["stop"] = max(p["stop"], p["entry"] * (1.0 + q10))
-                    if lo <= p["stop"]:
-                        px = px_o if px_o <= p["stop"] else min(p["stop"], hi)
-                        sold = True
-                    elif hi >= p["target"]:
-                        px = px_o if px_o >= p["target"] else p["target"]
-                        sold = True
-                    elif rules.get("use_logistic", True) \
-                            and fin(r["p_up"][i]) \
-                            and float(r["p_up"][i]) < tier["exit_p"]:
-                        px = px_c
-                        sold = True
-            if sold:
-                net = px * (1 - cost["slip"]) * (1 - cost["commission"]
-                                                 - cost["stamp"])
-                cash += p["shares"] * net
-                trades.append({"code": code, "ret": net / p["buy_net"] - 1.0,
-                               "pnl": p["shares"] * (net - p["buy_net"]),
-                               "hold": i - p["t_in"], "exit_d": d})
-                del pos[code]
-        # ---- 入场 ----
-        if len(pos) < tier["max_pos"]:
-            for r, i in by_date[d]:
-                code = r["code"]
-                if code in pos or len(pos) >= tier["max_pos"]:
-                    continue
-                ok = True
-                if mode == "baseline":
-                    if r["base_sigs"].get(d) != "BUY":
-                        ok = False
-                else:
-                    if rules.get("use_logistic", True):
-                        pv = float(r["p_up"][i])
-                        if not fin(pv) or pv < tier["p_th"]:
-                            ok = False
-                    if ok and rules.get("use_lgbm", True):
-                        H = int(r["h_choice"][i]) \
-                            if rules.get("adaptive_h", True) \
-                            else int(rules.get("h_fixed", 5))
-                        arr = r["ml"].get(H)
-                        rv = float(arr[i]) if arr is not None else float("nan")
-                        if not fin(rv) or rv < tier["r_th"]:
-                            ok = False
-                    elif ok and rules.get("use_quantile", True):
-                        rv = float(r["q"]["50"][i])
-                        if not fin(rv) or rv < tier["r_th"]:
-                            ok = False
-                    if ok and rules.get("use_quantile", True) \
-                            and rules.get("q50_entry", True) \
-                            and rules.get("use_lgbm", True):
-                        q50v = float(r["q"]["50"][i])
-                        if not fin(q50v) or q50v <= 0:
-                            ok = False
-                    if ok and rules.get("use_adaptive", True):
-                        av = float(r["adaptive"][i])
-                        if not fin(av) or av < tier["a_th"]:
-                            ok = False
-                if not ok:
-                    continue
-                ret_t = float(r["ret1"][i])
-                if ret_t >= _v4_limit_pct(code) - 0.005:
-                    continue        # 涨停无法买入
-                px_c = float(r["close"][i])
-                buy_net = px_c * (1 + cost["slip"]) * (1 + cost["commission"])
-                eq0 = cash + sum(pp["shares"] * last_close.get(c,
-                                 pp["last_px"])
-                                 for c, pp in pos.items())
-                shares = int(eq0 * tier["frac"] / buy_net / 100.0) * 100
-                if shares <= 0 or shares * buy_net > cash:
-                    continue
-                cash -= shares * buy_net
-                p = {"t_at": i, "t_in": i, "shares": shares,
-                     "buy_net": buy_net, "entry": px_c,
-                     "highest": max(px_c, float(r["high"][i])),
-                     "last_px": px_c, "entry_d": d}
-                q10a = r["q"]["10"]
-                q75a = r["q"]["75"]
-                if use_dist and fin(q10a[i]) and fin(q75a[i]):
-                    p["stop"] = p["entry"] * (1.0 + float(q10a[i]))
-                    p["target"] = p["entry"] * (1.0 + float(q75a[i]))
-                else:
-                    p["stop"] = None
-                    p["target"] = None
-                    p["atr_fallback"] = True
-                pos[code] = p
-        # ---- 收盘权益 ----
-        eq = cash + sum(pp["shares"] * last_close.get(c, pp["last_px"])
-                        for c, pp in pos.items())
-        for c, pp in pos.items():
-            if c in last_close:
-                pp["last_px"] = last_close[c]
-        eq_curve.append(eq)
-    # 期末强平（按最后收盘价+成本），使胜率/盈亏比统计完整
-    n_forced = 0
-    for code in sorted(pos):
-        pp = pos[code]
-        px = last_close.get(code, pp["last_px"])
-        net = px * (1 - cost["slip"]) * (1 - cost["commission"]
-                                         - cost["stamp"])
-        cash += pp["shares"] * net
-        trades.append({"code": code, "ret": net / pp["buy_net"] - 1.0,
-                       "pnl": pp["shares"] * (net - pp["buy_net"]),
-                       "hold": pp["t_at"] - pp["t_in"], "exit_d": cal[-1]})
-        n_forced += 1
-    m = _v4_metrics(eq_curve, cal, trades,
-                    stock_days=sum(len(r["dates"]) for r in preds))
-    m["equity"] = eq_curve
-    m["dates"] = cal
-    m["trade_list"] = trades
-    m["forced_closes"] = n_forced
-    return m
 
 
 def _v4_entry_score(mats, rules):
@@ -5393,11 +5269,13 @@ def _v4_entry_mask(M, rules, tier):
 
 
 def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
-    """组合级事件回测（矩阵版；语义与旧逐股循环版一致）。
+    """组合级事件回测（矩阵版，唯一实现）。
 
     - 信号日收盘成交；买入=收盘×(1+滑点)(1+佣金)；卖出=×(1-滑点)(1-佣金-印花税)
+      （v4.0.1 起佣金/印花税记 0，仅保留滑点）
     - 涨停禁买、跌停顺延；停牌持仓顺延；期末强平
-    - 分布退出：Q10棘轮止损（只收紧）+ Q75目标 + p_up 信号退出
+    - hybrid 混合退出（默认）：Q10棘轮止损（只收紧）+ 移动止盈棘轮 + p_up 信号退出
+    - exit_mode="dist"：v4.0 纯分布退出（Q10棘轮 + Q75硬目标 + p_up，实测持仓被压到4.7天）
     - 对照退出：ATR止损/移动止盈（v3.3 稳健参数）
     - baseline：v3.3 多维评分信号进出
     """
@@ -5406,6 +5284,7 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
     mode = rules.get("mode", "full")
     use_dist = rules.get("use_dist_exit", True) \
         and rules.get("use_quantile", True)
+    exit_mode = rules.get("exit_mode", "hybrid")
     cost = _V4_COST
     buy_mult = (1 + cost["slip"]) * (1 + cost["commission"])
     sell_mult = (1 - cost["slip"]) * (1 - cost["commission"]
@@ -5445,14 +5324,22 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
                         px = px_c
                         sold = True
                 else:
-                    q10 = M["q10"][ks, t]
-                    if np.isfinite(q10):
+                    # Q10 棘轮止损（只收紧不放宽）
+                    if rules.get("use_q10_stop", True):
+                        q10 = M["q10"][ks, t]
+                        if np.isfinite(q10):
+                            p["stop"] = max(p["stop"], p["entry"]
+                                            * (1.0 + float(q10)))
+                    # 移动止盈棘轮：浮盈触发后随最高价上移（拉长持仓）
+                    if exit_mode == "hybrid" \
+                            and rules.get("use_trailing", True) \
+                            and p["highest"] > p["entry"] * rp["trail_trigger"]:
                         p["stop"] = max(p["stop"],
-                                        p["entry"] * (1.0 + float(q10)))
+                                        p["highest"] * rp["trail_ratio"])
                     if lo <= p["stop"]:
                         px = px_o if px_o <= p["stop"] else min(p["stop"], hi)
                         sold = True
-                    elif hi >= p["target"]:
+                    elif exit_mode == "dist" and hi >= p["target"]:
                         px = px_o if px_o >= p["target"] else p["target"]
                         sold = True
                     elif rules.get("use_logistic", True) \
@@ -5488,7 +5375,10 @@ def _v4_portfolio_sim(mats, tier, rules, initial=_V4_CAPITAL):
                      "highest": max(px_c, float(M["high"][ks, t]))}
                 if use_dist and np.isfinite(M["q10"][ks, t]) \
                         and np.isfinite(M["q75"][ks, t]):
-                    p["stop"] = p["entry"] * (1.0 + float(M["q10"][ks, t]))
+                    if rules.get("use_q10_stop", True):
+                        p["stop"] = p["entry"] * (1.0 + float(M["q10"][ks, t]))
+                    else:
+                        p["stop"] = 0.0     # 无初始止损，随棘轮/移动止盈上移
                     p["target"] = p["entry"] * (1.0 + float(M["q75"][ks, t]))
                     p["atr_fallback"] = False
                 else:
@@ -5861,7 +5751,10 @@ def _v4_print_report(r):
         print(f"{f_:<10}{a['train_ic_med']:+9.3f}{a['stability_med']:8.2f}"
               f"{a['sel_pct']*100:7.0f}%{a['weight_med']:10.4f}")
     print("-" * 76)
-    print("组合回测（统一成本：滑点0.1%/佣金万3/印花税千1；初始100万）")
+    _c = _V4_COST
+    print("组合回测（成本：滑点%.2f%%/佣金%.3f%%/印花税%.2f%%；初始%d万）"
+          % (_c["slip"] * 100, _c["commission"] * 100, _c["stamp"] * 100,
+             int(_V4_CAPITAL / 10000)))
     print(f"{'策略':<24}{'年化':>9}{'回撤':>9}{'Calmar':>8}{'Sharpe':>8}"
           f"{'胜率':>7}{'盈亏比':>7}{'交易':>6}{'均持仓':>7}")
     for k, v in r["strategies"].items():
@@ -6269,6 +6162,11 @@ def run_full_a_research(min_bars=400, limit=0, progress=print):
 
 
 def main():
+    try:    # GBK 控制台无法编码的字符（如 ⚠️）降级为 ?，防打印崩溃
+        sys.stdout.reconfigure(errors="replace")
+        sys.stderr.reconfigure(errors="replace")
+    except Exception:
+        pass
     argv = sys.argv[1:]
     do_push = "--push" in argv
     argv = [a for a in argv if a != "--push"]
