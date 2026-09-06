@@ -3,14 +3,18 @@
 """股票形态相似度预测 · 命令行版（独立单文件，不依赖 stock_gui.py）
 
 与 stock_gui.py 共用同一套分析算法（由 build_cli.py 自动生成）：
-价格形态 + 量能状态 + 大盘 + 板块 + 同行业 + 同市值层 多级加权匹配。
+价格形态 + 量能状态 + 大盘 + 板块 + 同行业 + 同市值层 多级加权匹配，
+多算法消融选策略（训练/验证切分防过拟合）。
 内建 SQLite 缓存（stock_cache.db），同行业/同市值层样本池只回填一次。
-K线源自动切换：腾讯 -> 东财 -> 网易163 -> 新浪；支持代理（stock_gui.ini
-的 [proxy] url，如 http://127.0.0.1:7890）。
+K线源自动切换：腾讯(三域名轮换) -> 东财 -> 网易163 -> 新浪；支持代理。
 
-用法：python stock_predict.py [--push] [--refresh-cache] [股票代码]
+用法：python stock_predict.py [--push] [--refresh-cache] [--backfill]
+                             [--clean] [--research] [股票代码]
   --push           分析完成后把报告推送到 Pi 量化系统收件箱（ai-quant）
   --refresh-cache  刷新全市场代码表/市值分层（约1分钟，7天有效）
+  --backfill       全市场1000交易日日K回填（断点续传，配额内自动分晚完成）
+  --clean          数据清洗（结构异常/除权残留/退市/粘性，扫描+修复）
+  --research       全A研究报告：各算法 IC/胜率/年化/回撤 跨股聚合
 """
 
 
@@ -1121,6 +1125,287 @@ def prefetch(codes, workers=6, progress=None):
 
     ex = _SHARED_EX                # 全局共享线程池，不再每次新建
     list(ex.map(one, codes))
+
+
+# ================= 全市场深历史回填（集成版，原 backfill_full.py） =================
+# 腾讯单次上限800根 → 两页翻取1600根(≥1000目标)；三域名轮换；
+# 免费源有IP配额(东财批量~500只断连、腾讯每窗口~200请求501)：
+# 501 全局暂停自愈 + 断点续传，数晚跑满全市场。CLI: --backfill
+
+_BF_TX_HOSTS = [
+    "https://ifzq.gtimg.cn/appstock/app/fqkline/get",
+    "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+    "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
+]
+_BF_TX_I = [0]
+_BF_PAUSE = [0.0, 0]            # [暂停截止时间, 连续限流次数]
+
+
+def _bf_tx_fetch(full, end, count):
+    """腾讯K线单页：三域名轮换，全部501才抛（触发全局暂停）。"""
+    param = (f"?param={full},day,,{end},{count},qfq" if end
+             else f"?param={full},day,,,{count},qfq")
+    last = None
+    for k in range(len(_BF_TX_HOSTS)):
+        u = _BF_TX_HOSTS[(_BF_TX_I[0] + k) % len(_BF_TX_HOSTS)]
+        try:
+            txt = _http_get(u + param, decode="utf-8", retries=1, timeout=8)
+            _BF_TX_I[0] = (_BF_TX_I[0] + k + 1) % len(_BF_TX_HOSTS)
+            d = (json.loads(txt).get("data") or {}).get(full) or {}
+            bars = d.get("qfqday") or d.get("day") or []
+            out = []
+            for b in bars:
+                try:
+                    if float(b[2]) <= 0:
+                        continue
+                    out.append({"date": b[0], "open": float(b[1]),
+                                "close": float(b[2]), "high": float(b[3]),
+                                "low": float(b[4]), "vol": float(b[5])})
+                except (ValueError, IndexError):
+                    continue
+            return out
+        except Exception as e:
+            last = e
+    raise last
+
+
+def _bf_fetch_one(full, page=800):
+    """单只：腾讯翻页为主源，东财一次性全量兜底。"""
+    rows1 = _bf_tx_fetch(full, "", page)
+    if not rows1:
+        raise RuntimeError("腾讯空数据")
+    if len(rows1) >= page - 10:                 # 触顶 → 翻页补历史
+        import datetime
+        d0 = datetime.date.fromisoformat(rows1[0]["date"])
+        end = (d0 - datetime.timedelta(days=1)).isoformat()
+        try:
+            rows2 = _bf_tx_fetch(full, end, page)
+            have = {r["date"] for r in rows1}
+            rows1 = [r for r in rows2 if r["date"] not in have] + rows1
+        except Exception:
+            pass                                # 第二页失败就只装第一页
+    if len(rows1) >= 300:
+        return rows1
+    try:
+        rows = _fetch_eastmoney(full, count=1100)
+        if len(rows) >= 300:
+            return rows
+    except Exception:
+        pass
+    raise RuntimeError("有效数据不足300根")
+
+
+def backfill_full_market(progress=None, force=False, limit=0,
+                         workers=6, throttle=0.45, min_bars=950):
+    """全市场日K批量回填（≥min_bars根，断点续传）。返回统计dict。"""
+    global _MIN_INTERVAL
+    old_iv = _MIN_INTERVAL
+    _MIN_INTERVAL = throttle
+    try:
+        today = time.strftime("%Y-%m-%d")
+        import datetime
+        fresh = (datetime.date.today()
+                 - datetime.timedelta(days=6)).isoformat()
+        with db_conn() as conn:
+            codes = [r[0] for r in conn.execute(
+                "SELECT code FROM stocks WHERE code NOT LIKE 'bj%' "
+                "ORDER BY code").fetchall()]
+            if not codes:
+                refresh_all_codes(progress=progress)
+                with db_conn() as conn:
+                    codes = [r[0] for r in conn.execute(
+                        "SELECT code FROM stocks WHERE code NOT LIKE 'bj%' "
+                        "ORDER BY code").fetchall()]
+        if limit:
+            codes = codes[:limit]
+        have = {}
+        if not force:
+            with db_conn() as conn:
+                for c, n, d in conn.execute(
+                        "SELECT code, COUNT(*), MAX(date) FROM daily_bars "
+                        "GROUP BY code"):
+                    have[c] = (n, d or "")
+        todo = [c for c in codes
+                if not (have.get(c, (0, ""))[0] >= min_bars
+                        and have.get(c, (0, ""))[1] >= fresh)]
+        stat = {"total": len(codes), "todo": len(todo), "ok": 0,
+                "fail": 0, "codes": len(have)}
+        if not todo:
+            if progress:
+                progress(f"回填：全市场已达标，无需继续")
+            return stat
+        if progress:
+            progress(f"回填：待处理 {len(todo)}/{len(codes)} 只")
+        t0 = time.time()
+        done_n = [0]
+
+        def work(c):
+            if time.time() < _BF_PAUSE[0]:
+                time.sleep(_BF_PAUSE[0] - time.time())
+            try:
+                rows = [r for r in _bf_fetch_one(c)
+                        if r["date"] < today and _bar_ok(r)]
+                if not rows:
+                    raise RuntimeError("过滤后无有效数据")
+                with db_conn(commit=True) as conn:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO daily_bars"
+                        "(code,date,open,high,low,close,vol) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        [(c, r["date"], r["open"], r["high"], r["low"],
+                          r["close"], r["vol"]) for r in rows])
+                _BF_PAUSE[1] = 0
+                stat["ok"] += 1
+            except Exception as e:
+                msg = str(e)
+                if "501" in msg or "429" in msg or "503" in msg:
+                    _BF_PAUSE[1] = min(_BF_PAUSE[1] + 1, 4)
+                    wait = 120 if _BF_PAUSE[1] < 3 else 300
+                    _BF_PAUSE[0] = max(_BF_PAUSE[0], time.time() + wait)
+                stat["fail"] += 1
+            done_n[0] += 1
+            if progress and (done_n[0] % 20 == 0
+                             or done_n[0] == len(todo)):
+                el = time.time() - t0
+                eta = el / done_n[0] * (len(todo) - done_n[0])
+                progress(f"全市场回填 {done_n[0]}/{len(todo)} "
+                         f"({done_n[0] * 100 // len(todo)}%) "
+                         f"成功{stat['ok']} 失败{stat['fail']} "
+                         f"ETA {eta / 60:.0f}分")
+
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        with _TPE(max_workers=workers) as ex2:
+            list(ex2.map(work, todo))
+        if progress:
+            progress(f"回填完成：成功{stat['ok']} 失败{stat['fail']}"
+                     f"（失败的下次运行自动续传）")
+        return stat
+    finally:
+        _MIN_INTERVAL = old_iv
+
+
+# ================= 数据清洗（集成版；独立版见 data_clean.py） =================
+
+def _clean_bar_valid(r):
+    """单根bar结构校验（只查硬错误，不查影线比例——低价股分值效应会误杀）。"""
+    o, h, l, c = r[1], r[2], r[3], r[4]
+    if None in (o, h, l, c) or min(x for x in (o, h, l, c)) <= 0:
+        return False
+    if h < l or h < max(o, c) or l > min(o, c):
+        return False
+    return True
+
+
+def clean_daily_db(fix=True, progress=None):
+    """扫描并（可选）修复全库日K：结构异常/涨跌幅越界(除权残留)/
+    停牌缺口/退市/价格粘性。返回统计dict。与 data_clean.py 同规则。"""
+    import datetime as _dt
+    _today = _dt.date.today()
+    stats = {"codes": 0, "bad_bars": 0, "refetch": 0, "suspend": 0,
+             "delisted": 0, "stale": 0, "deleted": 0, "refetched": 0}
+    issues = {}
+    with db_conn(commit=bool(fix)) as conn:
+        names = {r[0]: (r[1] or "") for r in
+                 conn.execute("SELECT code, name FROM stocks").fetchall()}
+        if fix:
+            conn.execute("CREATE TABLE IF NOT EXISTS delisted("
+                         "code TEXT PRIMARY KEY, last_date TEXT, ts REAL)")
+        rows = conn.execute(
+            "SELECT code,date,open,high,low,close,vol FROM daily_bars "
+            "ORDER BY code,date").fetchall()
+        by = {}
+        for c, d, o, h, l, cl, v in rows:
+            by.setdefault(c, []).append((d, o, h, l, cl, v or 0.0))
+        stats["codes"] = len(by)
+        for ci, (c, bars) in enumerate(by.items()):
+            if progress and ci % 300 == 0:
+                progress(f"清洗扫描 {ci}/{len(by)}")
+            n = len(bars)
+            bad = [b for b in bars if not _clean_bar_valid(b)]
+            if bad:
+                issues.setdefault(c, []).append("bad")
+                stats["bad_bars"] += len(bad)
+            flags = []
+            name = names.get(c, "")
+            for prev, cur in zip(bars, bars[1:]):
+                pc, cl = prev[4], cur[4]
+                lim = _limit_pct(c, name, cur[0])
+                if not pc or not cl or lim is None:
+                    flags.append(False)
+                    continue
+                flags.append(abs(cl / pc - 1) * 100 > lim + 3.0)
+            viol = any(flags) if not _is_etf(c) else any(
+                a and b for a, b in zip(flags, flags[1:]))
+            if viol:
+                issues.setdefault(c, []).append("refetch")
+                stats["refetch"] += 1
+            gaps = 0
+            for a, b in zip(bars, bars[1:]):
+                try:
+                    da = _dt.datetime.strptime(a[0], "%Y-%m-%d").date()
+                    db2 = _dt.datetime.strptime(b[0], "%Y-%m-%d").date()
+                    if (db2 - da).days > 20:
+                        gaps += 1
+                except ValueError:
+                    continue
+            if gaps:
+                stats["suspend"] += 1
+            d1 = bars[-1][0]
+            try:
+                age = (_today - _dt.datetime.strptime(
+                    d1, "%Y-%m-%d").date()).days
+            except ValueError:
+                age = 0
+            if age > 180:
+                issues.setdefault(c, []).append(f"delisted:{d1}")
+                stats["delisted"] += 1
+            run = 1
+            for a, b in zip(bars, bars[1:]):
+                run = run + 1 if a[4] == b[4] and a[4] else 1
+                if run >= 20:
+                    issues.setdefault(c, []).append("stale")
+                    stats["stale"] += 1
+                    break
+        if fix:
+            for c, kinds in issues.items():
+                kinds_set = set(kinds)
+                if "bad" in kinds_set:
+                    bars = conn.execute(
+                        "SELECT date,open,high,low,close FROM daily_bars "
+                        "WHERE code=? ORDER BY date", (c,)).fetchall()
+                    dels = [(c, b[0]) for b in bars
+                            if not _clean_bar_valid(b)]
+                    if dels:
+                        conn.executemany(
+                            "DELETE FROM daily_bars WHERE code=? AND date=?",
+                            dels)
+                        stats["deleted"] += len(dels)
+                if ("refetch" in kinds_set or "stale" in kinds_set) \
+                        and not c.startswith("bj"):
+                    try:
+                        fresh = _bf_fetch_one(c)
+                        fd = [r for r in fresh
+                              if r["date"] < time.strftime("%Y-%m-%d")]
+                        if len(fd) >= 200:
+                            conn.execute(
+                                "DELETE FROM daily_bars WHERE code=?", (c,))
+                            conn.executemany(
+                                "INSERT OR REPLACE INTO daily_bars"
+                                "(code,date,open,high,low,close,vol) "
+                                "VALUES(?,?,?,?,?,?,?)",
+                                [(c, r["date"], r["open"], r["high"],
+                                  r["low"], r["close"], r["vol"])
+                                 for r in fd])
+                            stats["refetched"] += 1
+                    except Exception:
+                        pass            # 源不可用时保留原数据，下次再修
+                dl = next((k.split(":", 1)[1] for k in kinds
+                           if k.startswith("delisted:")), None)
+                if dl:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO delisted VALUES(?,?,?)",
+                        (c, dl, time.time()))
+    return stats
 
 
 # ================= 全市场代码表 / 分层 =================
@@ -2951,7 +3236,8 @@ def _sig_ma_trend(rows):
     return out
 
 
-def _composite_signals(rows, rp, idx_chg_by_date=None, chip_tail=400):
+def _composite_signals(rows, rp, idx_chg_by_date=None, chip_tail=400,
+                       use_chips=True):
     """多维评分信号（消融用，与GUI打分同构；筹码维度限尾段提速）。
     rp: 风险参数（buy_th/cooldown）。返回 [(i,date,"BUY"/"SELL",reason)]。"""
     n = len(rows)
@@ -2966,7 +3252,8 @@ def _composite_signals(rows, rp, idx_chg_by_date=None, chip_tail=400):
     ma20 = sma_period(closes, 20)
     vols_d = [r.get("vol") or 0.0 for r in rows]
     try:
-        chip_snaps = chip_snapshots(rows, tail=chip_tail)
+        chip_snaps = chip_snapshots(rows, tail=chip_tail) if use_chips \
+            else {}
     except Exception:
         chip_snaps = {}
     weak = idx_chg_by_date or {}
@@ -4310,12 +4597,363 @@ def push_report(full, res):
             pass
 
 
+# ==================== 全A研究报告跑批（--research） ====================
+
+def _rank_ic(a, b):
+    """Spearman 秩相关（numpy 实现，无 scipy 依赖）。"""
+    import numpy as _np
+    a, b = _np.asarray(a, float), _np.asarray(b, float)
+    m = ~( _np.isnan(a) | _np.isnan(b))
+    a, b = a[m], b[m]
+    if len(a) < 30:
+        return None
+    ra = _np.argsort(_np.argsort(a)).astype(float)
+    rb = _np.argsort(_np.argsort(b)).astype(float)
+    ra -= ra.mean(); rb -= rb.mean()
+    den = (_np.sqrt((ra ** 2).sum()) * _np.sqrt((rb ** 2).sum()))
+    return float((ra * rb).sum() / den) if den > 0 else None
+
+
+def _research_daily_scores(rows):
+    """每日多维评分（无冷却/无筹码，跨股IC用）。返回 [score,...]（与rows对齐）。"""
+    closes = [r["close"] for r in rows]
+    dif, dea, _ = calc_macd(closes)
+    k_, d_, _ = calc_kdj(rows)
+    r6 = calc_rsi(closes, 6)
+    _, b_up, b_low = calc_boll(closes)
+    pdi_a, mdi_a, adx_a = calc_adx(rows)
+    ma20 = sma_period(closes, 20)
+    vols = [r.get("vol") or 0.0 for r in rows]
+    out = []
+    for i in range(len(rows)):
+        if None in (dif[i], dea[i], dif[i - 1], dea[i - 1]):
+            out.append(None)
+            continue
+        sc = 0.0
+        sc += CFG.IND_W["MACD"] * (
+            2 if (dif[i - 1] <= dea[i - 1] and dif[i] > dea[i])
+            else -2 if (dif[i - 1] >= dea[i - 1] and dif[i] < dea[i])
+            else 1 if dif[i] > dea[i] else -1)
+        if None not in (k_[i], d_[i], k_[i - 1], d_[i - 1]):
+            sc += CFG.IND_W["KDJ"] * (
+                2 if (k_[i - 1] <= d_[i - 1] and k_[i] > d_[i] and k_[i] < 45)
+                else -2 if (k_[i - 1] >= d_[i - 1] and k_[i] < d_[i]
+                            and k_[i] > 65)
+                else 1 if k_[i] > d_[i] else -1)
+        if r6[i] is not None and r6[i - 1] is not None:
+            sc += CFG.IND_W["RSI"] * (
+                2 if (r6[i - 1] < 20 and r6[i] >= 20)
+                else -2 if (r6[i - 1] > 80 and r6[i] <= 80)
+                else 1 if r6[i] < 30 else -1 if r6[i] > 70 else 0)
+        c, cp = closes[i], closes[i - 1]
+        v5 = sum(vols[max(0, i - 5):i]) / max(1, min(5, i))
+        vr = vols[i] / v5 if v5 > 0 else 0.0
+        sc += CFG.IND_W["量价"] * (1 if (vr > 1.5 and c > cp)
+                                  else -1 if (vr > 1.5 and c < cp) else 0)
+        if ma20[i] and ma20[i - 1]:
+            sc += CFG.IND_W["MA20"] * (
+                1 if (c > ma20[i] and ma20[i] > ma20[i - 1])
+                else -1 if (c < ma20[i] and ma20[i] < ma20[i - 1]) else 0)
+        if None not in (b_up[i], b_low[i]):
+            sc += CFG.IND_W["布林带"] * (1 if c < b_low[i]
+                                        else -1 if c > b_up[i] else 0)
+        a_i, p_i, m_i = adx_a[i], pdi_a[i], mdi_a[i]
+        if None not in (a_i, p_i, m_i) and a_i >= 20:
+            sc += CFG.IND_W["ADX"] * (1 if p_i > m_i else -1)
+        out.append(sc)
+    return out
+
+
+def _research_one(bars):
+    """单只股票全算法研究计算（多进程worker，顶层函数可pickle）。
+    返回 {key: (ic, wr, ann, mdd, trades), ..., "bh": (ann, mdd)}。"""
+    import datetime as _dt
+    try:
+        out = {}
+        closes = [r["close"] for r in bars]
+        rets = logret(closes)
+        if len(rets) < 60:
+            return None
+        nxt = closes[1:]
+
+        def _pack(key, ic=None, bt=None, wr=None):
+            out[key] = (ic,
+                        bt["winrate"] if bt else wr,
+                        bt["ann"] if bt else None,
+                        bt["mdd"] if bt else None,
+                        bt["trades"] if bt else None)
+
+        # 状态序列（日线IC用）
+        dif_s, dea_s, _ = calc_macd(closes)
+        kd, dd, _ = calc_kdj(bars)
+        r6s = calc_rsi(closes, 6)
+        _, bu_s, bl_s = calc_boll(closes)
+        ma60s = sma_period(closes, 60)
+        states = {
+            "macd": [1 if (a is not None and b is not None and a > b)
+                     else -1 for a, b in zip(dif_s, dea_s)],
+            "kdj": [1 if (a is not None and b is not None and a > b)
+                    else -1 for a, b in zip(kd, dd)],
+            "rsi": [(-1 if v is None else (1 if v < 50 else -1))
+                    for v in r6s],
+            "boll": [(1 if (lo is not None and cl < lo)
+                      else -1 if (up is not None and cl > up) else 0)
+                     for cl, up, lo in zip(closes, bu_s, bl_s)],
+            "ma_trend": [1 if (m is not None and c > m) else -1
+                         for c, m in zip(closes, ma60s)],
+            "composite": _research_daily_scores(bars),
+        }
+        sigs_all = {"macd": _sig_macd(bars), "kdj": _sig_kdj(bars),
+                    "rsi": _sig_rsi(bars), "boll": _sig_boll(bars),
+                    "ma_trend": _sig_ma_trend(bars)}
+        rp0 = CFG.RISK_PARAMS["稳健"]
+        for key in ("macd", "kdj", "rsi", "boll", "ma_trend"):
+            ic = _rank_ic(states[key][:-1], nxt)
+            bt = _bt_events(bars, sigs_all[key], rp0) if sigs_all[key] \
+                else None
+            _pack(key, ic=ic, bt=bt)
+        # composite：状态IC + 三档事件回测
+        stc = states["composite"]
+        ic = _rank_ic([s for s in stc[:-1] if s is not None],
+                      [r for s, r in zip(stc[:-1], nxt) if s is not None])
+        _pack("composite", ic=ic)
+        for mode, rp in CFG.RISK_PARAMS.items():
+            sg_ = _composite_signals(bars, rp, use_chips=False)
+            bt = _bt_events(bars, sg_, rp) if sg_ else None
+            _pack(f"composite:{mode}", bt=bt)
+        # L1形态：逐步匹配 up_prob 的 IC 与方向命中率
+        W = W_WINDOW
+        ups, nxts = [], []
+        for i in range(W, len(rets) - W + 1, 5):
+            cur = znorm(rets[i - W:i])
+            d_arr = _px_distances(rets[:i], cur, W)
+            cand = [d_arr[k] for k in range(len(d_arr))
+                    if k + W <= i - W]
+            if len(cand) < 6:
+                continue
+            cand.sort()
+            idxs = sorted(range(len(d_arr)),
+                          key=lambda k2: d_arr[k2])[:CFG.TOPK]
+            tot = ups_n = 0
+            for k2 in idxs:
+                j = k2 + W
+                if j < len(bars) - 1:
+                    tot += 1
+                    ups_n += 1 if bars[j + 1]["close"] > bars[j]["close"] \
+                        else 0
+            if tot >= 5:
+                ups.append(ups_n / tot)
+                nxts.append(bars[i + 1]["close"] / bars[i]["close"] - 1)
+        if len(ups) >= 20:
+            ic = _rank_ic(ups, nxts)
+            dirhit = sum(1 for u, r in zip(ups, nxts)
+                         if (u > 0.5) == (r > 0)) / len(ups)
+            out["l1_pattern"] = (ic, dirhit, None, None, None)
+        # 买入持有基准
+        years = max((_dt.date.fromisoformat(bars[-1]["date"])
+                     - _dt.date.fromisoformat(bars[0]["date"])
+                     ).days / 365.25, 0.5)
+        tot_ret = bars[-1]["close"] / bars[0]["close"] - 1
+        bh_ann = (1 + tot_ret) ** (1 / years) - 1 if tot_ret > -1 else -1.0
+        peak = mdd = eq = 0.0
+        eq = 1.0
+        for a, b in zip(closes, closes[1:]):
+            eq *= b / a
+            peak = max(peak, eq)
+            if peak > 0:
+                mdd = min(mdd, eq / peak - 1)
+        out["bh"] = (bh_ann, mdd)
+        return out
+    except Exception:
+        log.exception("research_one 失败")
+        return None
+
+
+def run_full_a_research(min_bars=400, limit=0, progress=print):
+    """全A样本研究：逐股回测7类算法 + 信号IC，跨股票聚合统计。
+
+    返回 {"meta": {...}, "algos": {key: {...}}, "buyhold": {...}}。
+    指标口径：
+    - IC = 每股 spearman(信号状态T, 次日收益率T+1) 的中位数（跨股聚合）
+    - 胜率/年化/回撤 = 每股事件回测（信号日收盘成交+ATR止损）后取中位数
+    - 买入持有为同区间基准（中位年化/中位回撤）"""
+    with db_conn() as conn:
+        codes = [r[0] for r in conn.execute(
+            "SELECT code FROM daily_bars GROUP BY code "
+            "HAVING COUNT(*) >= ? AND code NOT LIKE 'bj%'",
+            (min_bars,)).fetchall()]
+    if limit:
+        codes = codes[:limit]
+    if progress:
+        progress(f"研究样本：{len(codes)} 只（≥{min_bars}根日K）")
+    algo_stats = {}       # key -> dict of lists
+    bh_ann, bh_mdd = [], []
+    ALGOS = (("macd", "MACD金叉死叉"), ("kdj", "KDJ金叉死叉"),
+             ("rsi", "RSI超买超卖"), ("boll", "布林带回归"),
+             ("ma_trend", "MA20/60趋势"), ("composite", "多维评分"),
+             ("l1_pattern", "L1形态up_prob"))
+
+    def _acc(key):
+        return algo_stats.setdefault(key, {
+            "ic": [], "wr": [], "ann": [], "mdd": [], "trades": []})
+
+    # ---- 多进程分块跑全A ----
+    from concurrent.futures import ProcessPoolExecutor
+    CH = 400
+    n_done = [0]
+    for ci in range(0, len(codes), CH):
+        chunk = codes[ci:ci + CH]
+        with db_conn() as conn:
+            ph = ",".join("?" for _ in chunk)
+            rws = conn.execute(
+                f"SELECT code,date,open,high,low,close,vol FROM ("
+                f" SELECT *, ROW_NUMBER() OVER (PARTITION BY code "
+                f" ORDER BY date DESC) rn FROM daily_bars "
+                f" WHERE code IN ({ph})"
+                f") WHERE rn<=1000 ORDER BY code, date", chunk).fetchall()
+        by = {}
+        for c, d, o, h, l, cl, v in rws:
+            by.setdefault(c, []).append(
+                {"date": d, "open": o, "high": h, "low": l,
+                 "close": cl, "vol": v or 0.0})
+        bars_list = [b for b in by.values() if len(b) >= min_bars]
+        del rws, by
+        try:
+            with ProcessPoolExecutor(max_workers=6) as ex:
+                for res in ex.map(_research_one, bars_list):
+                    if not res:
+                        continue
+                    n_done[0] += 1
+                    for key, vals in res.items():
+                        if key == "bh":
+                            if vals[0] is not None:
+                                bh_ann.append(vals[0])
+                                bh_mdd.append(vals[1])
+                            continue
+                        a = _acc(key)
+                        ic, wr, ann, mdd, trades = vals
+                        if ic is not None:
+                            a["ic"].append(ic)
+                        if wr is not None:
+                            a["wr"].append(wr)
+                        if ann is not None:
+                            a["ann"].append(ann)
+                        if mdd is not None:
+                            a["mdd"].append(mdd)
+                        if trades is not None:
+                            a["trades"].append(trades)
+        except Exception:
+            log.exception("研究多进程失败，退回单进程")
+            for bars in bars_list:
+                res = _research_one(bars)
+                if not res:
+                    continue
+                for key, vals in res.items():
+                    if key == "bh":
+                        if vals[0] is not None:
+                            bh_ann.append(vals[0])
+                            bh_mdd.append(vals[1])
+                    else:
+                        a = _acc(key)
+                        ic, wr, ann, mdd, trades = vals
+                        if ic is not None:
+                            a["ic"].append(ic)
+                        if wr is not None:
+                            a["wr"].append(wr)
+                        if ann is not None:
+                            a["ann"].append(ann)
+                        if mdd is not None:
+                            a["mdd"].append(mdd)
+                        if trades is not None:
+                            a["trades"].append(trades)
+        if progress:
+            progress(f"研究进度 {min(ci + CH, len(codes))}/{len(codes)} "
+                     f"(有效{n_done[0]})")
+
+    def _med(lst):
+        if not lst:
+            return None
+        s = sorted(lst)
+        n = len(s)
+        return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+    out = {"meta": {"n_codes": n_done[0], "min_bars": min_bars,
+                    "ts": time.strftime("%Y-%m-%d %H:%M")}, "algos": {}}
+    for key, label in ALGOS:
+        a = algo_stats.get(key, {})
+        out["algos"][key] = {
+            "label": label,
+            "n_ic": len(a.get("ic", [])),
+            "ic_med": _med(a.get("ic", [])),
+            "ic_pos": (sum(1 for x in a.get("ic", []) if x > 0)
+                       / len(a["ic"])) if a.get("ic") else None,
+            "wr_med": _med(a.get("wr", [])),
+            "ann_med": _med(a.get("ann", [])),
+            "mdd_med": _med(a.get("mdd", [])),
+            "trades_med": _med(a.get("trades", [])),
+        }
+    for mode in CFG.RISK_PARAMS:
+        a = algo_stats.get(f"composite:{mode}", {})
+        out["algos"][f"composite:{mode}"] = {
+            "label": f"多维评分·{mode}",
+            "n_ic": len(a.get("ic", [])), "ic_med": None, "ic_pos": None,
+            "wr_med": _med(a.get("wr", [])),
+            "ann_med": _med(a.get("ann", [])),
+            "mdd_med": _med(a.get("mdd", [])),
+            "trades_med": _med(a.get("trades", [])),
+        }
+    out["buyhold"] = {"ann_med": _med(bh_ann), "mdd_med": _med(bh_mdd),
+                      "n": len(bh_ann)}
+    return out
+
+
 def main():
     argv = sys.argv[1:]
     do_push = "--push" in argv
     argv = [a for a in argv if a != "--push"]
     do_refresh = "--refresh-cache" in argv
     argv = [a for a in argv if a != "--refresh-cache"]
+    do_backfill = "--backfill" in argv
+    argv = [a for a in argv if a != "--backfill"]
+    do_clean = "--clean" in argv
+    argv = [a for a in argv if a != "--clean"]
+    do_research = "--research" in argv
+    argv = [a for a in argv if a != "--research"]
+    if do_backfill and True:
+        backfill_full_market(progress=print)
+        if not argv:
+            return
+    if do_clean and True:
+        st = clean_daily_db(fix=True, progress=print)
+        print(f"清洗完成: 删除{st['deleted']}根 重拉{st['refetched']}只 "
+              f"退市{st['delisted']}只 停牌{st['suspend']}只")
+        if not argv:
+            return
+    if do_research and True:
+        import json as _json
+        r = run_full_a_research(progress=print)
+        print("\n" + "=" * 72)
+        print(f"全A研究 (n={r['meta']['n_codes']}只, "
+              f"≥{r['meta']['min_bars']}根K)  {r['meta']['ts']}")
+        print(f"{'算法':<18}{'IC中位':>8}{'IC>0占比':>9}{'胜率中位':>9}"
+              f"{'年化中位':>9}{'回撤中位':>9}{'交易中位':>8}")
+        for key, a in r["algos"].items():
+            f = lambda v, m=100, d="%": "-" if v is None else f"{v * m:+.2f}{d}"
+            print(f"{a['label']:<18}"
+                  f"{f(a['ic_med'], 100, ''):>8}"
+                  f"{f(a['ic_pos'], 100):>9}"
+                  f"{f(a['wr_med']):>9}"
+                  f"{f(a['ann_med']):>9}"
+                  f"{f(a['mdd_med']):>9}"
+                  f"{a['trades_med'] if a['trades_med'] is not None else '-':>8}")
+        bh = r["buyhold"]
+        print(f"{'买入持有(基准)':<18}{'-':>8}{'-':>9}{'-':>9}"
+              f"{bh['ann_med']*100:+.2f}%{bh['mdd_med']*100:+.2f}%{'-':>8}")
+        print("注：IC=信号状态与次日收益的spearman相关(跨股中位)；"
+              "胜率/年化/回撤为每股事件回测后跨股中位（含样本内成分，"
+              "实际选策略请用消融的训练/验证口径）")
+        if not argv:
+            return
     if do_refresh and True:
         print("刷新缓存数据库（全市场代码表/分层）...")
         refresh_all_codes(print)

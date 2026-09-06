@@ -21,14 +21,18 @@ CLI_HEADER = '''#!/usr/bin/env python3
 """股票形态相似度预测 · 命令行版（独立单文件，不依赖 stock_gui.py）
 
 与 stock_gui.py 共用同一套分析算法（由 build_cli.py 自动生成）：
-价格形态 + 量能状态 + 大盘 + 板块 + 同行业 + 同市值层 多级加权匹配。
+价格形态 + 量能状态 + 大盘 + 板块 + 同行业 + 同市值层 多级加权匹配，
+多算法消融选策略（训练/验证切分防过拟合）。
 内建 SQLite 缓存（stock_cache.db），同行业/同市值层样本池只回填一次。
-K线源自动切换：腾讯 -> 东财 -> 网易163 -> 新浪；支持代理（stock_gui.ini
-的 [proxy] url，如 http://127.0.0.1:7890）。
+K线源自动切换：腾讯(三域名轮换) -> 东财 -> 网易163 -> 新浪；支持代理。
 
-用法：python stock_predict.py [--push] [--refresh-cache] [股票代码]
+用法：python stock_predict.py [--push] [--refresh-cache] [--backfill]
+                             [--clean] [--research] [股票代码]
   --push           分析完成后把报告推送到 Pi 量化系统收件箱（ai-quant）
   --refresh-cache  刷新全市场代码表/市值分层（约1分钟，7天有效）
+  --backfill       全市场1000交易日日K回填（断点续传，配额内自动分晚完成）
+  --clean          数据清洗（结构异常/除权残留/退市/粘性，扫描+修复）
+  --research       全A研究报告：各算法 IC/胜率/年化/回撤 跨股聚合
 """
 
 '''

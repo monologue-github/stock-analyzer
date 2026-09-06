@@ -1116,6 +1116,287 @@ def prefetch(codes, workers=6, progress=None):
     list(ex.map(one, codes))
 
 
+# ================= 全市场深历史回填（集成版，原 backfill_full.py） =================
+# 腾讯单次上限800根 → 两页翻取1600根(≥1000目标)；三域名轮换；
+# 免费源有IP配额(东财批量~500只断连、腾讯每窗口~200请求501)：
+# 501 全局暂停自愈 + 断点续传，数晚跑满全市场。CLI: --backfill
+
+_BF_TX_HOSTS = [
+    "https://ifzq.gtimg.cn/appstock/app/fqkline/get",
+    "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+    "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
+]
+_BF_TX_I = [0]
+_BF_PAUSE = [0.0, 0]            # [暂停截止时间, 连续限流次数]
+
+
+def _bf_tx_fetch(full, end, count):
+    """腾讯K线单页：三域名轮换，全部501才抛（触发全局暂停）。"""
+    param = (f"?param={full},day,,{end},{count},qfq" if end
+             else f"?param={full},day,,,{count},qfq")
+    last = None
+    for k in range(len(_BF_TX_HOSTS)):
+        u = _BF_TX_HOSTS[(_BF_TX_I[0] + k) % len(_BF_TX_HOSTS)]
+        try:
+            txt = _http_get(u + param, decode="utf-8", retries=1, timeout=8)
+            _BF_TX_I[0] = (_BF_TX_I[0] + k + 1) % len(_BF_TX_HOSTS)
+            d = (json.loads(txt).get("data") or {}).get(full) or {}
+            bars = d.get("qfqday") or d.get("day") or []
+            out = []
+            for b in bars:
+                try:
+                    if float(b[2]) <= 0:
+                        continue
+                    out.append({"date": b[0], "open": float(b[1]),
+                                "close": float(b[2]), "high": float(b[3]),
+                                "low": float(b[4]), "vol": float(b[5])})
+                except (ValueError, IndexError):
+                    continue
+            return out
+        except Exception as e:
+            last = e
+    raise last
+
+
+def _bf_fetch_one(full, page=800):
+    """单只：腾讯翻页为主源，东财一次性全量兜底。"""
+    rows1 = _bf_tx_fetch(full, "", page)
+    if not rows1:
+        raise RuntimeError("腾讯空数据")
+    if len(rows1) >= page - 10:                 # 触顶 → 翻页补历史
+        import datetime
+        d0 = datetime.date.fromisoformat(rows1[0]["date"])
+        end = (d0 - datetime.timedelta(days=1)).isoformat()
+        try:
+            rows2 = _bf_tx_fetch(full, end, page)
+            have = {r["date"] for r in rows1}
+            rows1 = [r for r in rows2 if r["date"] not in have] + rows1
+        except Exception:
+            pass                                # 第二页失败就只装第一页
+    if len(rows1) >= 300:
+        return rows1
+    try:
+        rows = _fetch_eastmoney(full, count=1100)
+        if len(rows) >= 300:
+            return rows
+    except Exception:
+        pass
+    raise RuntimeError("有效数据不足300根")
+
+
+def backfill_full_market(progress=None, force=False, limit=0,
+                         workers=6, throttle=0.45, min_bars=950):
+    """全市场日K批量回填（≥min_bars根，断点续传）。返回统计dict。"""
+    global _MIN_INTERVAL
+    old_iv = _MIN_INTERVAL
+    _MIN_INTERVAL = throttle
+    try:
+        today = time.strftime("%Y-%m-%d")
+        import datetime
+        fresh = (datetime.date.today()
+                 - datetime.timedelta(days=6)).isoformat()
+        with db_conn() as conn:
+            codes = [r[0] for r in conn.execute(
+                "SELECT code FROM stocks WHERE code NOT LIKE 'bj%' "
+                "ORDER BY code").fetchall()]
+            if not codes:
+                refresh_all_codes(progress=progress)
+                with db_conn() as conn:
+                    codes = [r[0] for r in conn.execute(
+                        "SELECT code FROM stocks WHERE code NOT LIKE 'bj%' "
+                        "ORDER BY code").fetchall()]
+        if limit:
+            codes = codes[:limit]
+        have = {}
+        if not force:
+            with db_conn() as conn:
+                for c, n, d in conn.execute(
+                        "SELECT code, COUNT(*), MAX(date) FROM daily_bars "
+                        "GROUP BY code"):
+                    have[c] = (n, d or "")
+        todo = [c for c in codes
+                if not (have.get(c, (0, ""))[0] >= min_bars
+                        and have.get(c, (0, ""))[1] >= fresh)]
+        stat = {"total": len(codes), "todo": len(todo), "ok": 0,
+                "fail": 0, "codes": len(have)}
+        if not todo:
+            if progress:
+                progress(f"回填：全市场已达标，无需继续")
+            return stat
+        if progress:
+            progress(f"回填：待处理 {len(todo)}/{len(codes)} 只")
+        t0 = time.time()
+        done_n = [0]
+
+        def work(c):
+            if time.time() < _BF_PAUSE[0]:
+                time.sleep(_BF_PAUSE[0] - time.time())
+            try:
+                rows = [r for r in _bf_fetch_one(c)
+                        if r["date"] < today and _bar_ok(r)]
+                if not rows:
+                    raise RuntimeError("过滤后无有效数据")
+                with db_conn(commit=True) as conn:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO daily_bars"
+                        "(code,date,open,high,low,close,vol) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        [(c, r["date"], r["open"], r["high"], r["low"],
+                          r["close"], r["vol"]) for r in rows])
+                _BF_PAUSE[1] = 0
+                stat["ok"] += 1
+            except Exception as e:
+                msg = str(e)
+                if "501" in msg or "429" in msg or "503" in msg:
+                    _BF_PAUSE[1] = min(_BF_PAUSE[1] + 1, 4)
+                    wait = 120 if _BF_PAUSE[1] < 3 else 300
+                    _BF_PAUSE[0] = max(_BF_PAUSE[0], time.time() + wait)
+                stat["fail"] += 1
+            done_n[0] += 1
+            if progress and (done_n[0] % 20 == 0
+                             or done_n[0] == len(todo)):
+                el = time.time() - t0
+                eta = el / done_n[0] * (len(todo) - done_n[0])
+                progress(f"全市场回填 {done_n[0]}/{len(todo)} "
+                         f"({done_n[0] * 100 // len(todo)}%) "
+                         f"成功{stat['ok']} 失败{stat['fail']} "
+                         f"ETA {eta / 60:.0f}分")
+
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        with _TPE(max_workers=workers) as ex2:
+            list(ex2.map(work, todo))
+        if progress:
+            progress(f"回填完成：成功{stat['ok']} 失败{stat['fail']}"
+                     f"（失败的下次运行自动续传）")
+        return stat
+    finally:
+        _MIN_INTERVAL = old_iv
+
+
+# ================= 数据清洗（集成版；独立版见 data_clean.py） =================
+
+def _clean_bar_valid(r):
+    """单根bar结构校验（只查硬错误，不查影线比例——低价股分值效应会误杀）。"""
+    o, h, l, c = r[1], r[2], r[3], r[4]
+    if None in (o, h, l, c) or min(x for x in (o, h, l, c)) <= 0:
+        return False
+    if h < l or h < max(o, c) or l > min(o, c):
+        return False
+    return True
+
+
+def clean_daily_db(fix=True, progress=None):
+    """扫描并（可选）修复全库日K：结构异常/涨跌幅越界(除权残留)/
+    停牌缺口/退市/价格粘性。返回统计dict。与 data_clean.py 同规则。"""
+    import datetime as _dt
+    _today = _dt.date.today()
+    stats = {"codes": 0, "bad_bars": 0, "refetch": 0, "suspend": 0,
+             "delisted": 0, "stale": 0, "deleted": 0, "refetched": 0}
+    issues = {}
+    with db_conn(commit=bool(fix)) as conn:
+        names = {r[0]: (r[1] or "") for r in
+                 conn.execute("SELECT code, name FROM stocks").fetchall()}
+        if fix:
+            conn.execute("CREATE TABLE IF NOT EXISTS delisted("
+                         "code TEXT PRIMARY KEY, last_date TEXT, ts REAL)")
+        rows = conn.execute(
+            "SELECT code,date,open,high,low,close,vol FROM daily_bars "
+            "ORDER BY code,date").fetchall()
+        by = {}
+        for c, d, o, h, l, cl, v in rows:
+            by.setdefault(c, []).append((d, o, h, l, cl, v or 0.0))
+        stats["codes"] = len(by)
+        for ci, (c, bars) in enumerate(by.items()):
+            if progress and ci % 300 == 0:
+                progress(f"清洗扫描 {ci}/{len(by)}")
+            n = len(bars)
+            bad = [b for b in bars if not _clean_bar_valid(b)]
+            if bad:
+                issues.setdefault(c, []).append("bad")
+                stats["bad_bars"] += len(bad)
+            flags = []
+            name = names.get(c, "")
+            for prev, cur in zip(bars, bars[1:]):
+                pc, cl = prev[4], cur[4]
+                lim = _limit_pct(c, name, cur[0])
+                if not pc or not cl or lim is None:
+                    flags.append(False)
+                    continue
+                flags.append(abs(cl / pc - 1) * 100 > lim + 3.0)
+            viol = any(flags) if not _is_etf(c) else any(
+                a and b for a, b in zip(flags, flags[1:]))
+            if viol:
+                issues.setdefault(c, []).append("refetch")
+                stats["refetch"] += 1
+            gaps = 0
+            for a, b in zip(bars, bars[1:]):
+                try:
+                    da = _dt.datetime.strptime(a[0], "%Y-%m-%d").date()
+                    db2 = _dt.datetime.strptime(b[0], "%Y-%m-%d").date()
+                    if (db2 - da).days > 20:
+                        gaps += 1
+                except ValueError:
+                    continue
+            if gaps:
+                stats["suspend"] += 1
+            d1 = bars[-1][0]
+            try:
+                age = (_today - _dt.datetime.strptime(
+                    d1, "%Y-%m-%d").date()).days
+            except ValueError:
+                age = 0
+            if age > 180:
+                issues.setdefault(c, []).append(f"delisted:{d1}")
+                stats["delisted"] += 1
+            run = 1
+            for a, b in zip(bars, bars[1:]):
+                run = run + 1 if a[4] == b[4] and a[4] else 1
+                if run >= 20:
+                    issues.setdefault(c, []).append("stale")
+                    stats["stale"] += 1
+                    break
+        if fix:
+            for c, kinds in issues.items():
+                kinds_set = set(kinds)
+                if "bad" in kinds_set:
+                    bars = conn.execute(
+                        "SELECT date,open,high,low,close FROM daily_bars "
+                        "WHERE code=? ORDER BY date", (c,)).fetchall()
+                    dels = [(c, b[0]) for b in bars
+                            if not _clean_bar_valid(b)]
+                    if dels:
+                        conn.executemany(
+                            "DELETE FROM daily_bars WHERE code=? AND date=?",
+                            dels)
+                        stats["deleted"] += len(dels)
+                if ("refetch" in kinds_set or "stale" in kinds_set) \
+                        and not c.startswith("bj"):
+                    try:
+                        fresh = _bf_fetch_one(c)
+                        fd = [r for r in fresh
+                              if r["date"] < time.strftime("%Y-%m-%d")]
+                        if len(fd) >= 200:
+                            conn.execute(
+                                "DELETE FROM daily_bars WHERE code=?", (c,))
+                            conn.executemany(
+                                "INSERT OR REPLACE INTO daily_bars"
+                                "(code,date,open,high,low,close,vol) "
+                                "VALUES(?,?,?,?,?,?,?)",
+                                [(c, r["date"], r["open"], r["high"],
+                                  r["low"], r["close"], r["vol"])
+                                 for r in fd])
+                            stats["refetched"] += 1
+                    except Exception:
+                        pass            # 源不可用时保留原数据，下次再修
+                dl = next((k.split(":", 1)[1] for k in kinds
+                           if k.startswith("delisted:")), None)
+                if dl:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO delisted VALUES(?,?,?)",
+                        (c, dl, time.time()))
+    return stats
+
+
 # ================= 全市场代码表 / 分层 =================
 
 def stocks_age() -> float:
@@ -2878,7 +3159,8 @@ def _sig_ma_trend(rows):
     return out
 
 
-def _composite_signals(rows, rp, idx_chg_by_date=None, chip_tail=400):
+def _composite_signals(rows, rp, idx_chg_by_date=None, chip_tail=400,
+                       use_chips=True):
     """多维评分信号（消融用，与GUI打分同构；筹码维度限尾段提速）。
     rp: 风险参数（buy_th/cooldown）。返回 [(i,date,"BUY"/"SELL",reason)]。"""
     n = len(rows)
@@ -2893,7 +3175,8 @@ def _composite_signals(rows, rp, idx_chg_by_date=None, chip_tail=400):
     ma20 = sma_period(closes, 20)
     vols_d = [r.get("vol") or 0.0 for r in rows]
     try:
-        chip_snaps = chip_snapshots(rows, tail=chip_tail)
+        chip_snaps = chip_snapshots(rows, tail=chip_tail) if use_chips \
+            else {}
     except Exception:
         chip_snaps = {}
     weak = idx_chg_by_date or {}
@@ -5069,6 +5352,53 @@ class App:
             log.exception("清除策略缓存失败")
         self._ensure_strategy(self.res)
 
+    # ---------- 数据维护：全市场回填 / 数据清洗（后台执行） ----------
+
+    def run_backfill(self):
+        if getattr(self, "_bf_busy", False):
+            return
+        self._bf_busy = True
+        self.progress_var.set("后台全市场回填启动（进度见状态栏）...")
+
+        def work():
+            return backfill_full_market(progress=self._progress)
+
+        def done(res, err):
+            self._bf_busy = False
+            if err:
+                self.progress_var.set(f"全市场回填失败: {err}")
+                return
+            self.progress_var.set(
+                f"全市场回填：本次成功{res['ok']} 失败{res['fail']}"
+                f"（配额限制，下次运行自动续传）")
+
+        self._run_bg(work, done)
+
+    def run_clean(self):
+        if getattr(self, "_clean_busy", False):
+            return
+        self._clean_busy = True
+        self.progress_var.set("数据清洗中（扫描+修复）...")
+
+        def work():
+            return clean_daily_db(fix=True, progress=self._progress)
+
+        def done(res, err):
+            self._clean_busy = False
+            if err:
+                self.progress_var.set(f"数据清洗失败: {err}")
+                return
+            msg = (f"扫描 {res['codes']} 只代码：\n"
+                   f"结构异常删除 {res['deleted']} 根\n"
+                   f"整只重拉修复 {res['refetched']} 只"
+                   f"（源不可用时自动跳过）\n"
+                   f"停牌缺口 {res['suspend']} 只 · "
+                   f"疑似退市 {res['delisted']} 只已登记\n"
+                    f"价格粘性 {res['stale']} 只")
+            self.progress_var.set("数据清洗完成")
+            messagebox.showinfo("数据清洗", msg)
+        self._run_bg(work, done)
+
     def _auto_refresh(self):
         """每15分钟静默重跑当前代码分析，刷新当日实时K线与预测。"""
         code = self.code_var.get()
@@ -6925,6 +7255,10 @@ class App:
             side="left", padx=4)
         ttk.Button(btns, text="清除缓存", command=clear_cache).pack(
             side="left", padx=4)
+        ttk.Button(btns, text="全市场回填",
+                   command=self.run_backfill).pack(side="left", padx=4)
+        ttk.Button(btns, text="数据清洗",
+                   command=self.run_clean).pack(side="left", padx=4)
         if getattr(self, "compact", False):
             ttk.Button(btns, text="关机", command=self._shutdown_confirm).pack(
                 side="left", padx=4)
