@@ -5137,6 +5137,9 @@ _V4_VARIANTS = {
     "Rot-Strong": {"rot_strong": True},           # 只买跑赢大盘的行业
     "Rot-T10only": {"h_only": 10, "cooldown": 5, "min_hold": 5,
                     "rot_top": 0.70},             # T10王牌+板块轮动叠加
+    "RotT10+DispHi": {"h_only": 10, "cooldown": 5, "min_hold": 5,
+                      "rot_top": 0.70,
+                      "disp_min": 0.5},           # regime：仅高分化（轮动富集）环境
 }
 
 
@@ -5329,6 +5332,14 @@ def _v4_entry_mask(M, rules, tier):
             if rules.get("rot_strong") and "ind5" in M and "mkt5" in M:
                 with np.errstate(invalid="ignore"):
                     ok &= (M["ind5"] > M["mkt5"])   # 行业跑赢大盘
+            disp_min = rules.get("disp_min")    # regime：离散度分位门槛
+            if disp_min and "disp_rank" in M:
+                with np.errstate(invalid="ignore"):
+                    ok &= (M["disp_rank"] >= float(disp_min))
+            disp_max = rules.get("disp_max")    # regime：只在高/低分化环境交易
+            if disp_max is not None and "disp_rank" in M:
+                with np.errstate(invalid="ignore"):
+                    ok &= (M["disp_rank"] <= float(disp_max))
         ok &= ~M["limit_up"]
     return ok & M["has_bar"]
 
@@ -5362,6 +5373,16 @@ def _v4_entry_ok_cell(M, ks, t, tier, rules):
             return False
     if rules.get("rot_strong") and "ind5" in M and "mkt5" in M:
         if not (M["ind5"][ks, t] > M["mkt5"][ks, t]):
+            return False
+    disp_min = rules.get("disp_min")
+    if disp_min and "disp_rank" in M:
+        v = M["disp_rank"][ks, t]
+        if not np.isfinite(v) or v < float(disp_min):
+            return False
+    disp_max = rules.get("disp_max")
+    if disp_max is not None and "disp_rank" in M:
+        v = M["disp_rank"][ks, t]
+        if not np.isfinite(v) or v > float(disp_max):
             return False
     return True
 
@@ -5411,10 +5432,18 @@ def _v4_attach_rotation(M, cal, codes_s, ind_of, mkt, ind):
         if n >= 3:
             v = row[m]
             RANK[k, m] = v.argsort().argsort() / max(n - 1, 1)
+    # 行业动量离散度（轮动富集度）：行业5日收益横截面 std 的窗口内分位（0~1）
+    DISP = np.array([np.nanstd(R5[k]) if np.isfinite(R5[k]).sum() >= 3
+                     else np.nan for k in range(R5.shape[0])])
+    dm = np.isfinite(DISP)
+    DRANK = np.full(len(DISP), np.nan)
+    if dm.sum() >= 5:
+        DRANK[dm] = DISP[dm].argsort().argsort() / max(dm.sum() - 1, 1)
     ns, nc = M["close"].shape
     M["ind_rank5"] = np.full((ns, nc), np.nan)
     M["ind5"] = np.full((ns, nc), np.nan)
     M["mkt5"] = np.broadcast_to(MR5[None, :], (ns, nc)).copy()
+    M["disp_rank"] = np.broadcast_to(DRANK[None, :], (ns, nc)).copy()
     for k, x in enumerate(ind_names):
         j = jdx.get(x)
         if j is not None:
