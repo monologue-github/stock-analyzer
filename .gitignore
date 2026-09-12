@@ -10,6 +10,13 @@ stock_cache.db-*
 __pycache__/
 *.py[cod]
 
+# 插件私有数据（交易记录等）
+plugins/_data/
+
+# factor_lab 中间缓存/结果（由 backtest_factor_ablation.py 生成，可重跑）
+research/factor_lab/
+*.npz
+
 # --- 标准 Python 忽略项 ---
 .env
 .venv/

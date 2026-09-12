@@ -36,6 +36,17 @@ except ImportError:
 
 CACHE_OK = True
 
+# ---- 插件系统（GUI 专属；build_cli.py 抽取的算法块不包含本段）----
+try:
+    import sys as _sys
+    _HERE_DIR = os.path.dirname(os.path.abspath(__file__))
+    if _HERE_DIR not in _sys.path:
+        _sys.path.insert(0, _HERE_DIR)
+    from plugins import PluginAPI as _PluginAPI, load_all as _load_plugins
+except Exception:                                   # 插件目录缺失时降级
+    _PluginAPI = None
+    _load_plugins = None
+
 
 # ================= 内嵌缓存层（原 stock_cache.py，单文件化）
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -75,6 +86,11 @@ def setup_logging():
 setup_logging()
 
 KLINE_URL = "https://ifzq.gtimg.cn/appstock/app/fqkline/get"
+
+# DeepSeek API Key 读取优先级：环境变量 > ini 文件
+# 强烈建议通过环境变量 DEEPSEEK_API_KEY 设置，不要在磁盘留存明文 Key。
+ENV_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+
 # 急救箱(stock_firstaid.py)写入的备用源覆盖默认值：
 # ini [data] kline_url = 完整接口URL（须以http(s)开头，否则忽略）
 try:
@@ -156,8 +172,8 @@ class CFG:
     INTERVAL_K5 = 1.4
 
     # ---- 风险偏好（三级·网格寻优后参数）----
-    # 保守=信号严(评分3+冷却8)+止损紧(ATR1.5/回落4%即走) → 胜率40.9%·年化中位-0.9%（最优）
-    # 激进=捕捉机会(评分1+冷却3)+止损松(ATR2.5/回落10%) → 胜率31.7%·-6.0%，波动大机会多
+    # 保守=信号严(评分3+冷却8)+止损紧(ATR1.5/回落4%即走)
+    # 激进=捕捉机会(评分1+冷却3)+止损松(ATR2.5/回落10%)
     # 数据源：n=6000回测网格，详见 报告_买卖点收益回测.md
     RISK_MODE = "稳健"
     RISK_PARAMS = {
@@ -1681,6 +1697,16 @@ THEMES = {
         BTN_BG="#ffffff", BTN_FG="#1f2933", BTN_HOVER="#eef1f4",
         BTN_BORDER="#bbbbbb",
     ),
+    # 高对比：纯黑底 + 纯白字 + 亮边框/亮黄光标，适合弱光或视力不佳场景
+    "contrast": dict(
+        UP="#ff2d2d", DOWN="#00e676", PRED_C="#40c4ff", TPRED_C="#ffffff",
+        BG="#000000", GRID_C="#3a3a3a", GUIDE_C="#6b6b6b",
+        AXIS_TXT="#ffffff", TITLE_TXT="#ffffff", CROSS_C="#ffff00",
+        DARK_BG="#000000", PANEL_BG="#0a0a0a", FIELD_BG="#111111",
+        FG_MAIN="#ffffff",
+        BTN_BG="#000000", BTN_FG="#ffffff", BTN_HOVER="#333333",
+        BTN_BORDER="#ffffff",
+    ),
 }
 
 
@@ -2340,7 +2366,7 @@ def backtest_signals(rows, signals, rp=None):
                     else entry * 0.95
                 trail_stop = highest * rp["trail_ratio"] \
                     if highest > entry * rp["trail_trigger"] else atr_stop
-                
+
                 # 止损触发（日内最低触及止损价）
                 if l <= trail_stop:
                     exit_price = trail_stop
@@ -3571,6 +3597,20 @@ def _precompute_atr(rows, i0=0, i1=None):
     return atrs
 
 
+def _annualized_vol(rows, lookback=250):
+    """近 lookback 日对数收益年化波动率（无数据返回 None）。"""
+    closes = [r["close"] for r in rows[-lookback:] if r.get("close")]
+    if len(closes) < 30:
+        return None
+    rets = [math.log(closes[i] / closes[i - 1])
+            for i in range(1, len(closes)) if closes[i - 1] > 0]
+    if len(rets) < 20:
+        return None
+    mu = sum(rets) / len(rets)
+    var = sum((x - mu) ** 2 for x in rets) / (len(rets) - 1)
+    return math.sqrt(var) * math.sqrt(252.0)
+
+
 def run_ablation(full, rows, idx_rows=None, progress=None):
     """多算法消融回测（近1000交易日）。训练集选策略/验证集验证，防过拟合。
     v2026-09-12: 预计算ATR + 线程池并行候选评估，速度提升。
@@ -3653,25 +3693,54 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
 
     if not cands:
         return None
-    # 训练集选型（验证集绝不参与选择），每档最少3笔交易
-    def _pick(key):
-        pool = [c for c in cands if c["train"]["trades"] >= 3]
-        if not pool:
-            pool = cands
-        comp = [c for c in pool if c["algo"] == "composite"
-                and c["mode"] == "稳健"]
-        if key == "保守":
-            pool.sort(key=lambda c: (c["train"]["mdd"],
-                                     -c["train"]["winrate"]))
-        elif key == "激进":
-            pool.sort(key=lambda c: -c["train"]["ann"])
-        else:   # 稳健：收益回撤比
-            pool.sort(key=lambda c: -(c["train"]["ann"]
-                                      / max(abs(c["train"]["mdd"]), 0.05)))
-        return dict(pool[0]) if pool[0] else dict(comp[0])
+    # ---- 完整消融：每档在【全部候选】(算法 × 风险参数) 上按其目标选优 ----
+    def _calmar(m):
+        return m.get("ann", 0) / max(abs(m.get("mdd", 0.05)), 0.05)
 
-    out = {"mode_candidates": {"保守": _pick("保守"), "稳健": _pick("稳健"),
-                               "激进": _pick("激进")},
+    # 交易活跃度下限：避免选到“几乎不交易、回撤自然为 0”的假策略
+    _MIN_TR = 8
+
+    def _pick(key):
+        pool = [c for c in cands if c["train"].get("trades", 0) >= _MIN_TR]
+        if not pool:
+            pool = [c for c in cands if c["train"].get("trades", 0) >= 3]
+        if not pool:
+            pool = list(cands)
+        if not pool:
+            return {"algo": "composite", "mode": key,
+                    "params": dict(CFG.RISK_PARAMS.get(
+                        key, CFG.RISK_PARAMS["稳健"])),
+                    "label": f"多维评分·{key}（样本不足，固定回退）",
+                    "train": {}, "val": {}}
+        if key == "保守":
+            # 修正：旧代码按 mdd 升序（负数）= 选到最大回撤；改为在活跃候选里
+            # 按 |mdd| 升序，回撤最小优先、收益次之。
+            pool.sort(key=lambda c: (abs(c["train"].get("mdd", 0.05)),
+                                     -c["train"].get("ann", -1)))
+        elif key == "激进":
+            pool.sort(key=lambda c: -c["train"].get("ann", -1))
+        else:   # 稳健：收益回撤比
+            pool.sort(key=lambda c: -_calmar(c["train"]))
+        return dict(pool[0])
+
+    mode_candidates = {"保守": _pick("保守"), "稳健": _pick("稳健"),
+                       "激进": _pick("激进")}
+
+    # ---- 风险档推荐：验证集 Calmar 最优者；高波动股标注保守易被扫损 ----
+    def _vc(t):
+        v = (mode_candidates.get(t) or {}).get("val") or {}
+        if not v or v.get("trades", 0) < 3:
+            return None
+        return _calmar(v)
+    scored = [(t, _vc(t)) for t in ("保守", "稳健", "激进")]
+    scored = [(t, s) for t, s in scored if s is not None]
+    recommend = max(scored, key=lambda x: x[1])[0] if scored else "稳健"
+    vol = _annualized_vol(rows)
+
+    out = {"mode_candidates": mode_candidates,
+           "recommend": recommend,
+           "vol_ann": vol,
+           "high_vol": bool(vol is not None and vol > 0.45),
            "ts": time.time(), "bars": n, "train_n": split,
            "val_n": n - split}
     if progress:
@@ -4622,6 +4691,7 @@ _V4_HORIZONS = (1, 5, 10)
 _V4_FOLD = 40            # Walk-Forward 折大小（交易日）
 _V4_WARMUP = 60          # 因子预热期
 _V4_TRAIN_MIN = 180      # 首折最少训练样本
+_V4_EMBARGO = 5          # 训练/测试折间 embargo（根），防标签通过自相关泄漏
 _V4_QTS = (10, 25, 50, 75, 90)
 # v4.0.1：去掉佣金/印花税（记 0），只保留滑点——用户实际交易成本以滑点为主；
 # 键名保留以兼容旧报告结构，数值为 0 时乘法天然退化
@@ -4920,7 +4990,12 @@ def _v4_wf_impl(code, bars, industry):
         b = S - j * _V4_FOLD
         a = b - _V4_FOLD
         ta, tb = a - fa, b - fa         # 测试段输出数组内的偏移索引
-        tr = np.arange(0, a)
+        # Purge + embargo：训练标签 close[t+H] 不得跨越测试折起点 a
+        maxH = max(_V4_HORIZONS)
+        tr_end = max(0, a - maxH - _V4_EMBARGO)
+        if tr_end < _V4_TRAIN_MIN:
+            continue                    # 数据不足，该折不产出预测
+        tr = np.arange(0, tr_end)
         mu = Fc[tr].mean(axis=0)
         sd = Fc[tr].std(axis=0)
         sd[sd < 1e-9] = 1.0
@@ -4929,12 +5004,14 @@ def _v4_wf_impl(code, bars, industry):
         cut = int(len(tr) * 0.75)
         h_ic = {}
         for H in _V4_HORIZONS:
-            if not has_lgbm or cut < 60 or len(tr) - cut < 30:
+            # 内层训练同样要 purge，避免训练标签泄漏到内层验证集
+            inner_tr_end = max(0, cut - maxH - _V4_EMBARGO)
+            if not has_lgbm or inner_tr_end < 60 or len(tr) - cut < 30:
                 h_ic[H] = 0.0
                 continue
             try:
-                m_ = LGBMRegressor(**_V4_LGBM).fit(Z[tr[:cut]],
-                                                   Yc[H][tr[:cut]])
+                m_ = LGBMRegressor(**_V4_LGBM).fit(Z[tr[:inner_tr_end]],
+                                                   Yc[H][tr[:inner_tr_end]])
                 h_ic[H] = _v4_rankic(m_.predict(Z[tr[cut:]]),
                                      Yc[H][tr[cut:]]) or 0.0
             except Exception:
@@ -5028,6 +5105,19 @@ def _v4_wf_impl(code, bars, industry):
                              "stability": float(icir[i]),
                              "selected": bool(sel[i])}
                             for i, f in enumerate(_V4_FACTORS)]
+
+    # 过拟合守卫：LGBM 训练段 IC 显著高于测试段时，弃用该股 ml 预测
+    if ins_ic and per_stock_ic:
+        ins_med = float(np.median(ins_ic))
+        oos_all = [ic for H in _V4_HORIZONS for ic in per_stock_ic[H]]
+        oos_med = float(np.median(oos_all)) if oos_all else None
+        if oos_med is not None and ins_med - oos_med > 0.20:
+            log.warning("v4 %s LGBM 过拟合 guard 触发："
+                        "train_ic=%.3f oos_ic=%.3f，弃用 ml 预测",
+                        code, ins_med, oos_med)
+            for H in _V4_HORIZONS:
+                ml[H][:] = np.nan
+            ml_dyn[:] = np.nan
 
     if not np.isfinite(p_up).any() and not any(
             np.isfinite(ml[H]).any() for H in _V4_HORIZONS):
@@ -5170,7 +5260,7 @@ _V4_VARIANTS = {
 def _v4_entry_score(mats, rules):
     """与入场逻辑一致的 (score, label) pooled IC/MAE（矩阵向量化）。"""
     cal, M, codes = mats
-    if rules.get("use_lgbm", True):
+    if rules.get("use_lgbm", False):
         x, y = M["ml_dyn"], M["y_dyn"]
     elif rules.get("use_quantile", True):
         x, y = M["q50"], M["y5"]
@@ -5337,7 +5427,7 @@ def _v4_entry_mask(M, rules, tier):
             ok = M["has_bar"].copy()
             if rules.get("use_logistic", True):
                 ok &= (M["p_up"] >= tier["p_th"])
-            if rules.get("use_lgbm", True):
+            if rules.get("use_lgbm", False):
                 ok &= (M["ml_dyn"] >= tier["r_th"])
                 if rules.get("use_quantile", True) \
                         and rules.get("q50_entry", True):
@@ -5375,7 +5465,7 @@ def _v4_entry_ok_cell(M, ks, t, tier, rules):
     if rules.get("use_logistic", True) \
             and not (M["p_up"][ks, t] >= tier["p_th"]):
         return False
-    if rules.get("use_lgbm", True):
+    if rules.get("use_lgbm", False):
         if not (M["ml_dyn"][ks, t] >= tier["r_th"]):
             return False
         if rules.get("use_quantile", True) and rules.get("q50_entry", True) \
@@ -6199,12 +6289,32 @@ class App:
         self.view_pan = 0       # 平移偏移：0=最新，正=往左看更早
         self.ma_on = {nn: tk.BooleanVar(value=True) for nn in MA_COLORS}
 
+        # ---- 插件加载（失败不影响主程序）----
+        self._plugins = []
+        self._plugin_api = None
+        self._rt_choice = "预测参考"
+        if _PluginAPI is not None:
+            try:
+                self._plugin_api = _PluginAPI(
+                    self, os.path.dirname(os.path.abspath(__file__)))
+                self._plugins = _load_plugins(self._plugin_api, log=log)
+                if self._plugins:
+                    log.info("已加载插件 %d 个: %s", len(self._plugins),
+                             ", ".join(getattr(p, "name", "?")
+                                       for p in self._plugins))
+            except Exception:
+                log.exception("插件加载失败")
+
         self._build_toolbar()
         # 注册AI找源确认钩子：数据源全灭时弹窗询问（主线程弹窗，后台执行）
         globals()["_AI_RESCUE_HOOK"] = self._ai_rescue_flow
         if getattr(self, "_last_code", ""):
             self.code_var.set(self._last_code)
         self._build_body()
+        try:
+            root.protocol("WM_DELETE_WINDOW", self._on_close)
+        except Exception:
+            pass
         if not self.compact:
             self._refresh_names()       # 启动即拉取自选池名称（后台）
         if CACHE_OK:
@@ -6259,8 +6369,16 @@ class App:
         style.map("TNotebook.Tab",
                   background=[("selected", BTN_HOVER), ("active", BTN_HOVER)],
                   foreground=[("selected", "#ffffff")])
-        style.configure("Checkbutton", background=DARK_BG, foreground=FG_MAIN)
-        style.map("Checkbutton", background=[("active", DARK_BG)])
+        # 单选/复选：clam 主题悬停时背景默认近白(#eeebe7)，导致整块按钮变白、
+        # 白字不可见。这里显式映射 active/selected/disabled，随主题换色。
+        for _sub in ("TRadiobutton", "TCheckbutton"):
+            style.configure(_sub, background=DARK_BG, foreground=FG_MAIN,
+                            focuscolor=DARK_BG)
+            style.map(_sub,
+                      background=[("active", DARK_BG), ("selected", DARK_BG),
+                                  ("disabled", DARK_BG)],
+                      foreground=[("active", FG_MAIN), ("selected", FG_MAIN),
+                                  ("disabled", AXIS_TXT)])
 
     # ---------- 布局 ----------
 
@@ -6398,7 +6516,7 @@ class App:
         body = tk.Frame(self.root)
         body.pack(fill="both", expand=True)
 
-        # ---- 右侧：预测参考（先pack，防止遮挡图表；小屏省略）----
+        # ---- 右侧：预测参考 / 插件面板（先pack，防止遮挡图表；小屏省略）----
         right = None
         if not self.compact:
             right = ttk.LabelFrame(body, text=" 预测参考 ", padding=4)
@@ -6413,15 +6531,32 @@ class App:
             self._rt_btn.pack(side="right")
             self._rt_btn.bind("<Button-1>", lambda e: self._toggle_rt())
 
+            # 面板选择器：预测参考 / 已加载插件（无插件时不显示）
+            self._rt_panels = {}
+            self._rt_names = ["预测参考"]
+            self._rt_select = ttk.Combobox(rt, state="readonly", width=16,
+                                           values=self._rt_names)
+            self._rt_select.bind("<<ComboboxSelected>>",
+                                 lambda e: self._switch_rt())
+
             self._rt_content = tk.Frame(right, bg=DARK_BG)
             self._rt_content.pack(fill="both", expand=True)
 
-            self.side_txt = tk.Text(self._rt_content, width=38,
+            pred = tk.Frame(self._rt_content, bg=DARK_BG)
+            self.side_txt = tk.Text(pred, width=38,
                                     font=("Microsoft YaHei", 9),
                                     relief="flat", bg=PANEL_BG, fg=FG_MAIN,
                                     insertbackground=FG_MAIN,
                                     selectbackground="#2b3540")
             self.side_txt.pack(fill="both", expand=True)
+            self._rt_panels["预测参考"] = pred
+
+            self._mount_plugins()
+            if len(self._rt_names) > 1:
+                self._rt_select.config(values=self._rt_names)
+                self._rt_select.pack(side="left", fill="x", expand=True,
+                                     padx=(0, 4))
+            self._switch_rt(self._rt_choice)
         self._w_right = getattr(self, "_w_right", None)
 
         # ---- 左侧：自选池（固定宽度；小屏省略）----
@@ -6645,6 +6780,69 @@ class App:
             self._rt_content.pack(fill="both", expand=True)
         else:
             self._rt_content.pack_forget()
+
+    # ---------- 插件：右侧栏面板 ----------
+
+    def _mount_plugins(self):
+        """把已加载插件的面板挂进右侧栏（主题切换会重新调用）。"""
+        for p in getattr(self, "_plugins", []) or []:
+            name = getattr(p, "name", None)
+            if not name or name in self._rt_panels:
+                continue
+            try:
+                panel = p.build_panel(self._rt_content)
+            except Exception:
+                log.exception("插件面板构建失败: %s", name)
+                continue
+            if panel is not None:
+                self._rt_panels[name] = panel
+                self._rt_names.append(name)
+
+    def _switch_rt(self, name=None):
+        """切换右侧栏显示：预测参考 / 某插件面板。"""
+        panels = getattr(self, "_rt_panels", None)
+        if not panels:
+            return
+        if name is None and getattr(self, "_rt_select", None) is not None:
+            name = self._rt_select.get()
+        if name not in panels:
+            name = "预测参考"
+        for w in panels.values():
+            try:
+                w.pack_forget()
+            except Exception:
+                pass
+        try:
+            panels[name].pack(fill="both", expand=True)
+        except Exception:
+            log.exception("切换右侧栏面板失败: %s", name)
+        self._rt_choice = name
+        if getattr(self, "_rt_select", None) is not None:
+            self._rt_select.set(name)
+        if getattr(self, "_w_right", None) is not None:
+            try:
+                self._w_right.config(text=f" {name} ")
+            except Exception:
+                pass
+
+    def _notify_plugins(self, hook, *args):
+        """按钩子名回调所有插件，单个失败不影响其它。"""
+        for p in getattr(self, "_plugins", []) or []:
+            fn = getattr(p, hook, None)
+            if fn is None:
+                continue
+            try:
+                fn(*args)
+            except Exception:
+                log.exception("插件 %s.%s 失败", getattr(p, "name", "?"), hook)
+
+    def _on_close(self):
+        """窗口关闭：先让插件保存，再销毁。"""
+        self._notify_plugins("on_close")
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     # ---------- 运行分析 ----------
 
@@ -6888,17 +7086,36 @@ class App:
         win.title(f"策略消融选择 - {full}")
         win.configure(bg=DARK_BG)
         win.transient(self.root)
-        win.grab_set()
         ttk.Label(win, text=(
             f"基于近{abl['bars']}个交易日回测选策略 "
             f"（训练{abl['train_n']}日选型 / 验证{abl['val_n']}日防过拟合，"
             f"验证集未参与选择）\n"
+            f"每档在全部候选（6算法+多维评分 × 3风险参数）上独立选优\n"
             f"牛熊分界：上证指数收盘 vs MA120。以下胜率/年化/回撤为"
             f"【验证集】样本外数据，牛/熊评分为对应行情段的年化收益。")
                   ).pack(anchor="w", padx=12, pady=(10, 4))
-        box = ttk.Frame(win)
-        box.pack(fill="both", expand=True, padx=12, pady=4)
-        sel_var = tk.StringVar(value="稳健")
+        rec = abl.get("recommend", "稳健")
+        _vol = abl.get("vol_ann")
+        if _vol is not None:
+            _msg = (f"该股近一年年化波动率 {_vol * 100:.0f}%；"
+                    f"验证集 Calmar 最优档：{rec}")
+            if abl.get("high_vol"):
+                _msg += ("。高波动股保守档的宽止损易被反复触发，"
+                         "建议优先 稳健/激进。")
+            ttk.Label(win, text=_msg, foreground=AXIS_TXT, wraplength=560,
+                      justify="left").pack(anchor="w", padx=12, pady=(0, 4))
+        # 可滚动容器 + 屏幕限高：小屏也不会把内容顶出可视区
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=0, pady=4)
+        cv = tk.Canvas(body, bg=DARK_BG, highlightthickness=0)
+        sbar = ttk.Scrollbar(body, orient="vertical", command=cv.yview)
+        box = ttk.Frame(cv)
+        cv.create_window((0, 0), window=box, anchor="nw", tags="box")
+        cv.configure(yscrollcommand=sbar.set)
+        cv.pack(side="left", fill="both", expand=True, padx=(12, 0))
+        sbar.pack(side="right", fill="y")
+
+        sel_var = tk.StringVar(value=rec)
         order = ("保守", "稳健", "激进")
 
         def _fmt(v, pct=True):
@@ -6911,17 +7128,50 @@ class App:
             if not c:
                 continue
             tr, va = c.get("train") or {}, c.get("val") or {}
-            txt = (f"{mode}｜{c['label']}\n"
+            mark = "★推荐 " if mode == rec else ""
+            txt = (f"{mark}{mode}｜{c['label']}\n"
                    f"  验证期: 胜率{_fmt(va.get('winrate'))} "
                    f"年化{_fmt(va.get('ann'))} 回撤{_fmt(va.get('mdd'))} "
-                   f"交易{va.get('trades', 0)}笔"
-                   f"（训练期: 胜率{_fmt(tr.get('winrate'))} "
-                   f"年化{_fmt(tr.get('ann'))} 回撤{_fmt(tr.get('mdd'))}）\n"
+                   f"交易{va.get('trades', 0)}笔\n"
+                   f"  训练期: 胜率{_fmt(tr.get('winrate'))} "
+                   f"年化{_fmt(tr.get('ann'))} 回撤{_fmt(tr.get('mdd'))} "
+                   f"交易{tr.get('trades', 0)}笔\n"
                    f"  牛市评分{_fmt(c.get('bull'))}  "
                    f"熊市评分{_fmt(c.get('bear'))}")
-            rb = ttk.Radiobutton(box, text=txt, value=mode,
-                                 variable=sel_var)
-            rb.pack(anchor="w", pady=4)
+            cell = tk.Frame(box, bg=DARK_BG, bd=0,
+                            highlightbackground=BTN_BORDER,
+                            highlightcolor=BTN_BORDER,
+                            highlightthickness=1)
+            cell.pack(fill="x", padx=2, pady=4)
+            rbtn = ttk.Radiobutton(cell, text=txt, value=mode,
+                                   variable=sel_var)
+            rbtn.pack(anchor="w", padx=8, pady=6)
+
+        _fitting = [False]
+
+        def _fit(_e=None):
+            if _fitting[0]:
+                return
+            _fitting[0] = True
+            try:
+                box.update_idletasks()
+                cv.configure(scrollregion=cv.bbox("all"))
+                h = min(box.winfo_reqheight() + 190,
+                        int(self.root.winfo_screenheight() * 0.85))
+                w = min(max(box.winfo_reqwidth() + 60, 520),
+                        int(self.root.winfo_screenwidth() * 0.95))
+                cv.configure(width=w - 30, height=max(200, h - 170))
+                win.geometry(f"{w}x{h}")
+            finally:
+                _fitting[0] = False
+        box.bind("<Configure>", _fit)
+
+        def _wheel(e):
+            try:
+                cv.yview_scroll(-1 * (e.delta // 120), "units")
+            except Exception:
+                pass
+        cv.bind("<MouseWheel>", _wheel)
 
         def apply():
             c = abl["mode_candidates"].get(sel_var.get())
@@ -6939,12 +7189,34 @@ class App:
             except ValueError:
                 pass
 
+        def use_recommend():
+            sel_var.set(abl.get("recommend", "稳健"))
+            apply()
+
         btns = ttk.Frame(win)
         btns.pack(pady=10)
         ttk.Button(btns, text="应用所选策略", command=apply).pack(
             side="left", padx=6)
-        ttk.Button(btns, text="本次先用默认(多维·稳健)",
+        ttk.Button(btns, text=f"用推荐档({abl.get('recommend', '稳健')})",
+                   command=use_recommend).pack(side="left", padx=6)
+        ttk.Button(btns, text="本次不选(默认多维·稳健)",
                    command=win.destroy).pack(side="left", padx=6)
+
+        # 布局完成后定位居中并抓取焦点；任何情况下都保证窗口可见
+        try:
+            _fit()
+            win.update_idletasks()
+            w = win.winfo_reqwidth()
+            h = win.winfo_reqheight()
+            x = max(0, (self.root.winfo_screenwidth() - w) // 2)
+            y = max(0, (self.root.winfo_screenheight() - h) // 3)
+            win.geometry(f"+{x}+{y}")
+            win.deiconify()
+            win.lift()
+            win.focus_force()
+            win.grab_set()
+        except Exception:
+            log.exception("策略弹窗布局失败")
 
     def _rerun_strategy(self):
         """手动重选：清除策略缓存并重新消融（工具菜单入口）。"""
@@ -7062,6 +7334,7 @@ class App:
         res["phase"] = market_phase_text(q.get("time"))
         self._set_info(q)
         self._rerender()
+        self._notify_plugins("on_tick", q)
 
     def _tick(self):
         """秒级实时：只拉一次行情快照，更新现价/实时bar/预测区间/状态角标。"""
@@ -7093,6 +7366,7 @@ class App:
         self._save_ini()
         self._set_info()
         self._rerender()
+        self._notify_plugins("on_analysis", res)
 
     def _set_info(self, q=None):
         """顶栏信息行（盘前不显示过期今开，锚定提示在图表右下角）。"""
@@ -8123,7 +8397,9 @@ class App:
                                                 fallback="dark")
                 self.settings["updown"] = cp.get("ui", "updown",
                                                  fallback="red_up")
-                self.api_key = cp.get("deepseek", "api_key", fallback="")
+                # 环境变量优先；若无再从 ini 读取（兼容旧版，建议迁移到环境变量）
+                self.api_key = ENV_API_KEY or cp.get(
+                    "deepseek", "api_key", fallback="")
                 self.proxy_url = cp.get("proxy", "url", fallback="")
             except Exception:
                 pass
@@ -8140,7 +8416,14 @@ class App:
         cp.set("ui", "updown", self.settings["updown"])
         if not cp.has_section("deepseek"):
             cp.add_section("deepseek")
-        cp.set("deepseek", "api_key", self.api_key)
+        if ENV_API_KEY:
+            # 环境变量已提供 Key，不再把 Key 写回 ini，避免明文落盘
+            cp.set("deepseek", "api_key", "")
+            cp.set("deepseek", "api_key_source", "env")
+        else:
+            # 仅在无环境变量时回写 ini；仍建议迁移到环境变量
+            cp.set("deepseek", "api_key", self.api_key)
+            cp.set("deepseek", "api_key_source", "ini")
         if not cp.has_section("proxy"):
             cp.add_section("proxy")
         cp.set("proxy", "url", getattr(self, "proxy_url", ""))
@@ -8524,16 +8807,18 @@ class App:
         ai_result.pack(fill="both", expand=True)
 
         def _ensure_key():
-            key = self.api_key
+            key = ENV_API_KEY or self.api_key
+            if key:
+                return key
+            key = simpledialog.askstring(
+                "DeepSeek API Key",
+                "首次使用请输入 DeepSeek API Key\n"
+                "（建议配置环境变量 DEEPSEEK_API_KEY，避免明文落盘）：",
+                show="*", parent=win)
             if not key:
-                key = simpledialog.askstring(
-                    "DeepSeek API Key",
-                    "首次使用请输入 DeepSeek API Key\n(仅保存在本地 stock_gui.ini)：",
-                    show="*", parent=win)
-                if not key:
-                    return None
-                self.api_key = key.strip()
-                self._save_ini()
+                return None
+            self.api_key = key.strip()
+            self._save_ini()
             return self.api_key
 
         def _render():
@@ -8669,6 +8954,8 @@ class App:
                         value="dark").grid(row=0, column=1, sticky="w")
         ttk.Radiobutton(frm, text="亮色", variable=theme_var,
                         value="light").grid(row=0, column=2, sticky="w")
+        ttk.Radiobutton(frm, text="高对比", variable=theme_var,
+                        value="contrast").grid(row=0, column=3, sticky="w")
 
         ttk.Label(frm, text="涨跌配色").grid(row=1, column=0, sticky="w", pady=4)
         ud_var = tk.StringVar(value=self.settings["updown"])
@@ -8679,9 +8966,14 @@ class App:
 
         ttk.Label(frm, text="DeepSeek Key").grid(row=2, column=0, sticky="w",
                                                  pady=(8, 4))
-        key_var = tk.StringVar(value=self.api_key)
+        key_var = tk.StringVar(value=("" if ENV_API_KEY else self.api_key))
         ent = ttk.Entry(frm, textvariable=key_var, width=42, show="*")
         ent.grid(row=2, column=1, columnspan=2, sticky="we", pady=(8, 4))
+        if ENV_API_KEY:
+            ttk.Label(frm, text="当前从环境变量 DEEPSEEK_API_KEY 读取",
+                      foreground=AXIS_TXT,
+                      font=("Microsoft YaHei", 8)).grid(
+                          row=2, column=1, columnspan=2, sticky="e")
 
         ttk.Label(frm, text="AI 分析模型").grid(row=3, column=0, sticky="w",
                                                 pady=4)
@@ -8770,8 +9062,13 @@ class App:
             self.settings["theme"] = theme_var.get()
             self.settings["updown"] = ud_var.get()
             new_key = key_var.get().strip()
-            key_changed = new_key != self.api_key
-            self.api_key = new_key
+            if ENV_API_KEY:
+                # 环境变量优先级最高；设置页输入框仅作提示，不覆盖
+                key_changed = False
+                self.api_key = ENV_API_KEY
+            else:
+                key_changed = new_key != self.api_key
+                self.api_key = new_key
             self.proxy_url = proxy_var.get().strip()
             if CACHE_OK:
                 set_proxy(self.proxy_url)
@@ -8870,6 +9167,27 @@ class App:
             ttk.Button(btns, text="关机", command=self._shutdown_confirm).pack(
                 side="left", padx=4)
 
+        # ---- 关于 / 免责声明 ----
+        sep = ttk.Separator(frm, orient="horizontal")
+        sep.grid(row=21, column=0, columnspan=3, sticky="we", pady=(14, 8))
+        about = tk.Text(frm, width=40 if self.compact else 52,
+                        height=6 if self.compact else 11, relief="flat",
+                        bg=PANEL_BG, fg=FG_MAIN, font=("Microsoft YaHei", 9),
+                        wrap="word", highlightthickness=0)
+        about.grid(row=22, column=0, columnspan=3, sticky="we")
+        about.insert("end", "作者：獨白\n")
+        about.insert("end", "邮箱：kingrux106@gmail.com\n")
+        about.insert("end", "QQ：2180287399\n")
+        about.insert("end", "\n【免责声明】\n")
+        about.insert(
+            "end",
+            "本程序所有内容（包括但不限于K线、指标、形态相似度统计预测、"
+            "AI分析）仅为历史数据的技术统计与个人学习研究用途，"
+            "不构成任何投资建议或收益承诺。股票有风险，"
+            "据此操作产生的盈亏与后果由使用者自行承担。"
+            "请遵守所在地区法律法规，理性投资。")
+        about.config(state="disabled")
+
     def _shutdown_confirm(self):
         """小屏设备专用：确认后关机（需 sudoers 免密授权 shutdown）。"""
         if not messagebox.askyesno(
@@ -8889,28 +9207,7 @@ class App:
                              "sudo sh -c \"echo '%s ALL=(ALL) NOPASSWD: "
                              "/usr/sbin/shutdown, /sbin/shutdown, "
                              "/usr/sbin/poweroff' > /etc/sudoers.d/stock-shutdown\""
-                             % os.environ.get("USER", "lan"))
-
-        # ---- 关于 / 免责声明 ----
-        sep = ttk.Separator(frm, orient="horizontal")
-        sep.grid(row=6, column=0, columnspan=3, sticky="we", pady=(14, 8))
-        about = tk.Text(frm, width=40 if self.compact else 52,
-                        height=6 if self.compact else 11, relief="flat",
-                        bg=PANEL_BG, fg=FG_MAIN, font=("Microsoft YaHei", 9),
-                        wrap="word", highlightthickness=0)
-        about.grid(row=7, column=0, columnspan=3, sticky="we")
-        about.insert("end", "作者：獨白\n")
-        about.insert("end", "邮箱：kingrux106@gmail.com\n")
-        about.insert("end", "QQ：2180287399\n")
-        about.insert("end", "\n【免责声明】\n")
-        about.insert(
-            "end",
-            "本程序所有内容（包括但不限于K线、指标、形态相似度统计预测、"
-            "AI分析）仅为历史数据的技术统计与个人学习研究用途，"
-            "不构成任何投资建议或收益承诺。股票有风险，"
-            "据此操作产生的盈亏与后果由使用者自行承担。"
-            "请遵守所在地区法律法规，理性投资。")
-        about.config(state="disabled")
+                              % os.environ.get("USER", "lan"))
 
     def _rebuild_ui(self):
         """销毁重建全部控件（主题切换后刷新配色）。"""
@@ -8921,6 +9218,7 @@ class App:
         self._style_ttk()
         self._build_toolbar()
         self._build_body()
+        self._notify_plugins("on_theme_changed")
         self._render_watchlist()
         if self.res:
             self._rerender()

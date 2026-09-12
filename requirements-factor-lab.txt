@@ -1,0 +1,4 @@
+# factor_lab 全A因子级消融所需依赖
+numpy>=2.0
+scipy>=1.11
+scikit-learn>=1.3

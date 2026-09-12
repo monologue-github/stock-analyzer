@@ -88,6 +88,11 @@ def setup_logging():
 setup_logging()
 
 KLINE_URL = "https://ifzq.gtimg.cn/appstock/app/fqkline/get"
+
+# DeepSeek API Key 读取优先级：环境变量 > ini 文件
+# 强烈建议通过环境变量 DEEPSEEK_API_KEY 设置，不要在磁盘留存明文 Key。
+ENV_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+
 # 急救箱(stock_firstaid.py)写入的备用源覆盖默认值：
 # ini [data] kline_url = 完整接口URL（须以http(s)开头，否则忽略）
 try:
@@ -169,8 +174,8 @@ class CFG:
     INTERVAL_K5 = 1.4
 
     # ---- 风险偏好（三级·网格寻优后参数）----
-    # 保守=信号严(评分3+冷却8)+止损紧(ATR1.5/回落4%即走) → 胜率40.9%·年化中位-0.9%（最优）
-    # 激进=捕捉机会(评分1+冷却3)+止损松(ATR2.5/回落10%) → 胜率31.7%·-6.0%，波动大机会多
+    # 保守=信号严(评分3+冷却8)+止损紧(ATR1.5/回落4%即走)
+    # 激进=捕捉机会(评分1+冷却3)+止损松(ATR2.5/回落10%)
     # 数据源：n=6000回测网格，详见 报告_买卖点收益回测.md
     RISK_MODE = "稳健"
     RISK_PARAMS = {
@@ -1694,6 +1699,16 @@ THEMES = {
         BTN_BG="#ffffff", BTN_FG="#1f2933", BTN_HOVER="#eef1f4",
         BTN_BORDER="#bbbbbb",
     ),
+    # 高对比：纯黑底 + 纯白字 + 亮边框/亮黄光标，适合弱光或视力不佳场景
+    "contrast": dict(
+        UP="#ff2d2d", DOWN="#00e676", PRED_C="#40c4ff", TPRED_C="#ffffff",
+        BG="#000000", GRID_C="#3a3a3a", GUIDE_C="#6b6b6b",
+        AXIS_TXT="#ffffff", TITLE_TXT="#ffffff", CROSS_C="#ffff00",
+        DARK_BG="#000000", PANEL_BG="#0a0a0a", FIELD_BG="#111111",
+        FG_MAIN="#ffffff",
+        BTN_BG="#000000", BTN_FG="#ffffff", BTN_HOVER="#333333",
+        BTN_BORDER="#ffffff",
+    ),
 }
 
 
@@ -1759,6 +1774,16 @@ THEMES = {
         FG_MAIN="#1f2933",
         BTN_BG="#ffffff", BTN_FG="#1f2933", BTN_HOVER="#eef1f4",
         BTN_BORDER="#bbbbbb",
+    ),
+    # 高对比：纯黑底 + 纯白字 + 亮边框/亮黄光标，适合弱光或视力不佳场景
+    "contrast": dict(
+        UP="#ff2d2d", DOWN="#00e676", PRED_C="#40c4ff", TPRED_C="#ffffff",
+        BG="#000000", GRID_C="#3a3a3a", GUIDE_C="#6b6b6b",
+        AXIS_TXT="#ffffff", TITLE_TXT="#ffffff", CROSS_C="#ffff00",
+        DARK_BG="#000000", PANEL_BG="#0a0a0a", FIELD_BG="#111111",
+        FG_MAIN="#ffffff",
+        BTN_BG="#000000", BTN_FG="#ffffff", BTN_HOVER="#333333",
+        BTN_BORDER="#ffffff",
     ),
 }
 
@@ -2419,7 +2444,7 @@ def backtest_signals(rows, signals, rp=None):
                     else entry * 0.95
                 trail_stop = highest * rp["trail_ratio"] \
                     if highest > entry * rp["trail_trigger"] else atr_stop
-                
+
                 # 止损触发（日内最低触及止损价）
                 if l <= trail_stop:
                     exit_price = trail_stop
@@ -3650,6 +3675,20 @@ def _precompute_atr(rows, i0=0, i1=None):
     return atrs
 
 
+def _annualized_vol(rows, lookback=250):
+    """近 lookback 日对数收益年化波动率（无数据返回 None）。"""
+    closes = [r["close"] for r in rows[-lookback:] if r.get("close")]
+    if len(closes) < 30:
+        return None
+    rets = [math.log(closes[i] / closes[i - 1])
+            for i in range(1, len(closes)) if closes[i - 1] > 0]
+    if len(rets) < 20:
+        return None
+    mu = sum(rets) / len(rets)
+    var = sum((x - mu) ** 2 for x in rets) / (len(rets) - 1)
+    return math.sqrt(var) * math.sqrt(252.0)
+
+
 def run_ablation(full, rows, idx_rows=None, progress=None):
     """多算法消融回测（近1000交易日）。训练集选策略/验证集验证，防过拟合。
     v2026-09-12: 预计算ATR + 线程池并行候选评估，速度提升。
@@ -3732,25 +3771,54 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
 
     if not cands:
         return None
-    # 训练集选型（验证集绝不参与选择），每档最少3笔交易
-    def _pick(key):
-        pool = [c for c in cands if c["train"]["trades"] >= 3]
-        if not pool:
-            pool = cands
-        comp = [c for c in pool if c["algo"] == "composite"
-                and c["mode"] == "稳健"]
-        if key == "保守":
-            pool.sort(key=lambda c: (c["train"]["mdd"],
-                                     -c["train"]["winrate"]))
-        elif key == "激进":
-            pool.sort(key=lambda c: -c["train"]["ann"])
-        else:   # 稳健：收益回撤比
-            pool.sort(key=lambda c: -(c["train"]["ann"]
-                                      / max(abs(c["train"]["mdd"]), 0.05)))
-        return dict(pool[0]) if pool[0] else dict(comp[0])
+    # ---- 完整消融：每档在【全部候选】(算法 × 风险参数) 上按其目标选优 ----
+    def _calmar(m):
+        return m.get("ann", 0) / max(abs(m.get("mdd", 0.05)), 0.05)
 
-    out = {"mode_candidates": {"保守": _pick("保守"), "稳健": _pick("稳健"),
-                               "激进": _pick("激进")},
+    # 交易活跃度下限：避免选到“几乎不交易、回撤自然为 0”的假策略
+    _MIN_TR = 8
+
+    def _pick(key):
+        pool = [c for c in cands if c["train"].get("trades", 0) >= _MIN_TR]
+        if not pool:
+            pool = [c for c in cands if c["train"].get("trades", 0) >= 3]
+        if not pool:
+            pool = list(cands)
+        if not pool:
+            return {"algo": "composite", "mode": key,
+                    "params": dict(CFG.RISK_PARAMS.get(
+                        key, CFG.RISK_PARAMS["稳健"])),
+                    "label": f"多维评分·{key}（样本不足，固定回退）",
+                    "train": {}, "val": {}}
+        if key == "保守":
+            # 修正：旧代码按 mdd 升序（负数）= 选到最大回撤；改为在活跃候选里
+            # 按 |mdd| 升序，回撤最小优先、收益次之。
+            pool.sort(key=lambda c: (abs(c["train"].get("mdd", 0.05)),
+                                     -c["train"].get("ann", -1)))
+        elif key == "激进":
+            pool.sort(key=lambda c: -c["train"].get("ann", -1))
+        else:   # 稳健：收益回撤比
+            pool.sort(key=lambda c: -_calmar(c["train"]))
+        return dict(pool[0])
+
+    mode_candidates = {"保守": _pick("保守"), "稳健": _pick("稳健"),
+                       "激进": _pick("激进")}
+
+    # ---- 风险档推荐：验证集 Calmar 最优者；高波动股标注保守易被扫损 ----
+    def _vc(t):
+        v = (mode_candidates.get(t) or {}).get("val") or {}
+        if not v or v.get("trades", 0) < 3:
+            return None
+        return _calmar(v)
+    scored = [(t, _vc(t)) for t in ("保守", "稳健", "激进")]
+    scored = [(t, s) for t, s in scored if s is not None]
+    recommend = max(scored, key=lambda x: x[1])[0] if scored else "稳健"
+    vol = _annualized_vol(rows)
+
+    out = {"mode_candidates": mode_candidates,
+           "recommend": recommend,
+           "vol_ann": vol,
+           "high_vol": bool(vol is not None and vol > 0.45),
            "ts": time.time(), "bars": n, "train_n": split,
            "val_n": n - split}
     if progress:
@@ -4701,6 +4769,7 @@ _V4_HORIZONS = (1, 5, 10)
 _V4_FOLD = 40            # Walk-Forward 折大小（交易日）
 _V4_WARMUP = 60          # 因子预热期
 _V4_TRAIN_MIN = 180      # 首折最少训练样本
+_V4_EMBARGO = 5          # 训练/测试折间 embargo（根），防标签通过自相关泄漏
 _V4_QTS = (10, 25, 50, 75, 90)
 # v4.0.1：去掉佣金/印花税（记 0），只保留滑点——用户实际交易成本以滑点为主；
 # 键名保留以兼容旧报告结构，数值为 0 时乘法天然退化
@@ -4999,7 +5068,12 @@ def _v4_wf_impl(code, bars, industry):
         b = S - j * _V4_FOLD
         a = b - _V4_FOLD
         ta, tb = a - fa, b - fa         # 测试段输出数组内的偏移索引
-        tr = np.arange(0, a)
+        # Purge + embargo：训练标签 close[t+H] 不得跨越测试折起点 a
+        maxH = max(_V4_HORIZONS)
+        tr_end = max(0, a - maxH - _V4_EMBARGO)
+        if tr_end < _V4_TRAIN_MIN:
+            continue                    # 数据不足，该折不产出预测
+        tr = np.arange(0, tr_end)
         mu = Fc[tr].mean(axis=0)
         sd = Fc[tr].std(axis=0)
         sd[sd < 1e-9] = 1.0
@@ -5008,12 +5082,14 @@ def _v4_wf_impl(code, bars, industry):
         cut = int(len(tr) * 0.75)
         h_ic = {}
         for H in _V4_HORIZONS:
-            if not has_lgbm or cut < 60 or len(tr) - cut < 30:
+            # 内层训练同样要 purge，避免训练标签泄漏到内层验证集
+            inner_tr_end = max(0, cut - maxH - _V4_EMBARGO)
+            if not has_lgbm or inner_tr_end < 60 or len(tr) - cut < 30:
                 h_ic[H] = 0.0
                 continue
             try:
-                m_ = LGBMRegressor(**_V4_LGBM).fit(Z[tr[:cut]],
-                                                   Yc[H][tr[:cut]])
+                m_ = LGBMRegressor(**_V4_LGBM).fit(Z[tr[:inner_tr_end]],
+                                                   Yc[H][tr[:inner_tr_end]])
                 h_ic[H] = _v4_rankic(m_.predict(Z[tr[cut:]]),
                                      Yc[H][tr[cut:]]) or 0.0
             except Exception:
@@ -5107,6 +5183,19 @@ def _v4_wf_impl(code, bars, industry):
                              "stability": float(icir[i]),
                              "selected": bool(sel[i])}
                             for i, f in enumerate(_V4_FACTORS)]
+
+    # 过拟合守卫：LGBM 训练段 IC 显著高于测试段时，弃用该股 ml 预测
+    if ins_ic and per_stock_ic:
+        ins_med = float(np.median(ins_ic))
+        oos_all = [ic for H in _V4_HORIZONS for ic in per_stock_ic[H]]
+        oos_med = float(np.median(oos_all)) if oos_all else None
+        if oos_med is not None and ins_med - oos_med > 0.20:
+            log.warning("v4 %s LGBM 过拟合 guard 触发："
+                        "train_ic=%.3f oos_ic=%.3f，弃用 ml 预测",
+                        code, ins_med, oos_med)
+            for H in _V4_HORIZONS:
+                ml[H][:] = np.nan
+            ml_dyn[:] = np.nan
 
     if not np.isfinite(p_up).any() and not any(
             np.isfinite(ml[H]).any() for H in _V4_HORIZONS):
@@ -5249,7 +5338,7 @@ _V4_VARIANTS = {
 def _v4_entry_score(mats, rules):
     """与入场逻辑一致的 (score, label) pooled IC/MAE（矩阵向量化）。"""
     cal, M, codes = mats
-    if rules.get("use_lgbm", True):
+    if rules.get("use_lgbm", False):
         x, y = M["ml_dyn"], M["y_dyn"]
     elif rules.get("use_quantile", True):
         x, y = M["q50"], M["y5"]
@@ -5416,7 +5505,7 @@ def _v4_entry_mask(M, rules, tier):
             ok = M["has_bar"].copy()
             if rules.get("use_logistic", True):
                 ok &= (M["p_up"] >= tier["p_th"])
-            if rules.get("use_lgbm", True):
+            if rules.get("use_lgbm", False):
                 ok &= (M["ml_dyn"] >= tier["r_th"])
                 if rules.get("use_quantile", True) \
                         and rules.get("q50_entry", True):
@@ -5454,7 +5543,7 @@ def _v4_entry_ok_cell(M, ks, t, tier, rules):
     if rules.get("use_logistic", True) \
             and not (M["p_up"][ks, t] >= tier["p_th"]):
         return False
-    if rules.get("use_lgbm", True):
+    if rules.get("use_lgbm", False):
         if not (M["ml_dyn"][ks, t] >= tier["r_th"]):
             return False
         if rules.get("use_quantile", True) and rules.get("q50_entry", True) \
