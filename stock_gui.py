@@ -3448,20 +3448,22 @@ def _sig_l1_pattern(rows, W=None, step=5, up_th=0.6, dn_th=0.4):
 
 # ---- 区间事件回测（信号日收盘成交 + ATR止损/移动止盈，防前视）----
 
-def _bt_events(rows, signals, rp, i0=0, i1=None):
-    """在 rows[i0:i1] 上模拟交易。返回指标dict；交易数不足返回 None。"""
+def _bt_events(rows, signals, rp, i0=0, i1=None, atrs=None):
+    """在 rows[i0:i1] 上模拟交易。返回指标dict；交易数不足返回 None。
+    atrs 可外部预计算加速。"""
     i1 = len(rows) if i1 is None else min(i1, len(rows))
     if i1 - i0 < 30:
         return None
     sig_map = {s[0]: s[2] for s in signals if i0 <= s[0] < i1}
-    # ATR(14) 预计算
-    atrs = [0.0] * len(rows)
-    for i in range(i0 + 14, i1):
-        s = 0.0
-        for j in range(i - 13, i + 1):
-            h, l, pc = rows[j]["high"], rows[j]["low"], rows[j - 1]["close"]
-            s += max(h - l, abs(h - pc), abs(l - pc))
-        atrs[i] = s / 14
+    # ATR(14) 预计算（若未传入）
+    if atrs is None:
+        atrs = [0.0] * len(rows)
+        for i in range(i0 + 14, i1):
+            s = 0.0
+            for j in range(i - 13, i + 1):
+                h, l, pc = rows[j]["high"], rows[j]["low"], rows[j - 1]["close"]
+                s += max(h - l, abs(h - pc), abs(l - pc))
+            atrs[i] = s / 14
     eq = 1.0
     entry = None
     highest = None
@@ -3556,8 +3558,22 @@ def _bull_bear_score(rows, curve, i0, regime):
     return _ann(bull_r), _ann(bear_r)
 
 
+def _precompute_atr(rows, i0=0, i1=None):
+    """预计算 ATR(14)，供 run_ablation 批量回测复用。"""
+    i1 = len(rows) if i1 is None else min(i1, len(rows))
+    atrs = [0.0] * len(rows)
+    for i in range(i0 + 14, i1):
+        s = 0.0
+        for j in range(i - 13, i + 1):
+            h, l, pc = rows[j]["high"], rows[j]["low"], rows[j - 1]["close"]
+            s += max(h - l, abs(h - pc), abs(l - pc))
+        atrs[i] = s / 14
+    return atrs
+
+
 def run_ablation(full, rows, idx_rows=None, progress=None):
     """多算法消融回测（近1000交易日）。训练集选策略/验证集验证，防过拟合。
+    v2026-09-12: 预计算ATR + 线程池并行候选评估，速度提升。
 
     返回 {"mode_candidates": {保守:strat, 稳健:strat, 激进:strat},
           "ts": ..., "bars": n, "train_n":, "val_n":} 或 None。
@@ -3571,7 +3587,13 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
     val_n = max(200, n // 4)
     split = n - val_n
     regime = _regime_map(idx_rows, n)
-    # 各算法信号（只生成一次）
+    # 预计算ATR，所有候选复用
+    atrs = _precompute_atr(rows, 0, n)
+    if progress:
+        progress("策略消融回测中(近1000交易日)...")
+
+    # 生成所有基础信号（只生成一次）
+    sig_cache = {}
     gens = {
         "macd": lambda: _sig_macd(rows),
         "kdj": lambda: _sig_kdj(rows),
@@ -3580,53 +3602,55 @@ def run_ablation(full, rows, idx_rows=None, progress=None):
         "ma_trend": lambda: _sig_ma_trend(rows),
         "l1_pattern": lambda: _sig_l1_pattern(rows),
     }
-    if progress:
-        progress("策略消融回测中(近1000交易日)...")
-    cands = []
-    base = dict(CFG.risk_params())
     for algo, gen in gens.items():
         try:
-            sigs = gen()
+            sig_cache[algo] = gen()
         except Exception:
             log.warning("消融信号生成失败 %s", algo, exc_info=True)
-            continue
-        if not sigs:
-            continue
+            sig_cache[algo] = []
+
+    # 任务列表：(algo, mode, rp, is_composite)
+    tasks = []
+    for algo in gens:
         for mode, rp in CFG.RISK_PARAMS.items():
-            tr = _bt_events(rows, sigs, rp, 0, split)
-            va = _bt_events(rows, sigs, rp, split, n)
-            if not tr:
-                continue
-            bull, bear = _bull_bear_score(
-                rows, tr["curve"], tr["i0"], regime)
-            cands.append({"algo": algo, "mode": mode, "params": dict(rp),
-                          "label": f"{ALGO_LABEL.get(algo, algo)}·{mode}",
-                          "train": {k: v for k, v in tr.items()
-                                    if k != "curve"},
-                          "val": ({k: v for k, v in va.items()
-                                   if k != "curve"} if va else None),
-                          "bull": bull, "bear": bear})
-    # 多维评分 × 3风险档
+            tasks.append((algo, mode, rp, False))
     for mode, rp in CFG.RISK_PARAMS.items():
-        try:
-            sigs = _composite_signals(rows, rp, idx_chg_by_date=None)
-        except Exception:
-            log.warning("composite信号生成失败 %s", mode, exc_info=True)
-            continue
-        if not sigs:
-            continue
-        tr = _bt_events(rows, sigs, rp, 0, split)
-        va = _bt_events(rows, sigs, rp, split, n)
+        tasks.append(("composite", mode, rp, True))
+
+    def _eval_task(task):
+        algo, mode, rp, is_comp = task
+        if is_comp:
+            try:
+                sigs = _composite_signals(rows, rp, idx_chg_by_date=None)
+            except Exception:
+                log.warning("composite信号生成失败 %s", mode, exc_info=True)
+                return None
+        else:
+            sigs = sig_cache.get(algo)
+            if not sigs:
+                return None
+        tr = _bt_events(rows, sigs, rp, 0, split, atrs=atrs)
+        va = _bt_events(rows, sigs, rp, split, n, atrs=atrs)
         if not tr:
-            continue
+            return None
         bull, bear = _bull_bear_score(rows, tr["curve"], tr["i0"], regime)
-        cands.append({"algo": "composite", "mode": mode,
-                      "params": dict(rp),
-                      "label": f"多维评分·{mode}",
-                      "train": {k: v for k, v in tr.items() if k != "curve"},
-                      "val": ({k: v for k, v in va.items() if k != "curve"}
-                              if va else None),
-                      "bull": bull, "bear": bear})
+        label = (f"多维评分·{mode}" if is_comp
+                 else f"{ALGO_LABEL.get(algo, algo)}·{mode}")
+        return {"algo": algo, "mode": mode, "params": dict(rp),
+                "label": label,
+                "train": {k: v for k, v in tr.items() if k != "curve"},
+                "val": ({k: v for k, v in va.items() if k != "curve"}
+                        if va else None),
+                "bull": bull, "bear": bear}
+
+    cands = []
+    # 使用线程池并行评估候选（I/O轻、计算密集，GIL会部分释放）
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as exe:
+        for r in exe.map(_eval_task, tasks):
+            if r is not None:
+                cands.append(r)
+
     if not cands:
         return None
     # 训练集选型（验证集绝不参与选择），每档最少3笔交易

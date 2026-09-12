@@ -1,0 +1,159 @@
+{
+  "total_stocks": 5518,
+  "timestamp": "2026-09-12T08:32:44.254856",
+  "modes": {
+    "保守": {
+      "count": 5518,
+      "algo_distribution": {
+        "kdj": {
+          "count": 1922,
+          "pct": 34.83
+        },
+        "rsi": {
+          "count": 92,
+          "pct": 1.67
+        },
+        "composite": {
+          "count": 981,
+          "pct": 17.78
+        },
+        "l1_pattern": {
+          "count": 1397,
+          "pct": 25.32
+        },
+        "macd": {
+          "count": 635,
+          "pct": 11.51
+        },
+        "boll": {
+          "count": 341,
+          "pct": 6.18
+        },
+        "ma_trend": {
+          "count": 150,
+          "pct": 2.72
+        }
+      },
+      "train": {
+        "ann_median": -0.10918938284202262,
+        "ann_mean": -0.10209245277602602,
+        "mdd_median": -0.48908567349866183,
+        "winrate_median": 0.34615384615384615,
+        "trades_median": 32.0
+      },
+      "val": {
+        "ann_median": -0.06935297989912403,
+        "ann_mean": -0.03401412219431746,
+        "mdd_median": -0.2385775727057855,
+        "winrate_median": 0.38461538461538464,
+        "trades_median": 10.0
+      },
+      "regime": {
+        "bull_ann_median": 0.0007886572033425442,
+        "bear_ann_median": -0.22671367403752274
+      }
+    },
+    "稳健": {
+      "count": 5518,
+      "algo_distribution": {
+        "macd": {
+          "count": 727,
+          "pct": 13.18
+        },
+        "composite": {
+          "count": 817,
+          "pct": 14.81
+        },
+        "kdj": {
+          "count": 343,
+          "pct": 6.22
+        },
+        "l1_pattern": {
+          "count": 711,
+          "pct": 12.89
+        },
+        "boll": {
+          "count": 743,
+          "pct": 13.47
+        },
+        "ma_trend": {
+          "count": 1037,
+          "pct": 18.79
+        },
+        "rsi": {
+          "count": 1140,
+          "pct": 20.66
+        }
+      },
+      "train": {
+        "ann_median": 0.11320506448191348,
+        "ann_mean": 0.1375502277945559,
+        "mdd_median": -0.11859321117124633,
+        "winrate_median": 0.5263157894736842,
+        "trades_median": 17.0
+      },
+      "val": {
+        "ann_median": -0.020395843660346746,
+        "ann_mean": -0.0018040613125081522,
+        "mdd_median": -0.11905359058425347,
+        "winrate_median": 0.4,
+        "trades_median": 7.0
+      },
+      "regime": {
+        "bull_ann_median": 0.1644930900113536,
+        "bear_ann_median": 0.06191209837471648
+      }
+    },
+    "激进": {
+      "count": 5518,
+      "algo_distribution": {
+        "macd": {
+          "count": 811,
+          "pct": 14.7
+        },
+        "composite": {
+          "count": 799,
+          "pct": 14.48
+        },
+        "kdj": {
+          "count": 647,
+          "pct": 11.73
+        },
+        "l1_pattern": {
+          "count": 772,
+          "pct": 13.99
+        },
+        "boll": {
+          "count": 909,
+          "pct": 16.47
+        },
+        "ma_trend": {
+          "count": 500,
+          "pct": 9.06
+        },
+        "rsi": {
+          "count": 1080,
+          "pct": 19.57
+        }
+      },
+      "train": {
+        "ann_median": 0.14501100172372383,
+        "ann_mean": 0.16386842744283903,
+        "mdd_median": -0.19323784582606413,
+        "winrate_median": 0.5,
+        "trades_median": 21.0
+      },
+      "val": {
+        "ann_median": -0.03238257469521866,
+        "ann_mean": -0.00538242384148319,
+        "mdd_median": -0.17230475343236384,
+        "winrate_median": 0.38461538461538464,
+        "trades_median": 8.0
+      },
+      "regime": {
+        "bull_ann_median": 0.24009648473714312,
+        "bear_ann_median": 0.05528178979363829
+      }
+    }
+  }
+}
