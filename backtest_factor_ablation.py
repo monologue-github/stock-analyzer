@@ -30,6 +30,9 @@ def main():
                     choices=("chip", "build", "panel", "enum", "validate",
                              "all"))
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--sample", type=int, default=None,
+                    help="按行业分层随机抽样 N 只")
+    ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--workers", type=int, default=None)
     ap.add_argument("--weights", default="both",
                     choices=("equal", "framework", "both"))
@@ -53,7 +56,8 @@ def main():
         print("=" * 70)
         print("Stage 2/4 因子面板构建（Pass A + Pass B）")
         print("=" * 70)
-        panel_mod.stage_build(limit=args.limit, workers=args.workers)
+        panel_mod.stage_build(limit=args.limit, workers=args.workers,
+                              sample=args.sample, seed=args.seed)
 
     if args.stage in ("panel",):
         panel_mod.assemble_panel()

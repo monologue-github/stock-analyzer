@@ -1,34 +1,73 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""data_clean.py - 股票日K缓存数据清洗（独立脚本，直接操作 stock_cache.db）
+"""data_clean.py - 股票日K缓存数据清洗/复权口径迁移（独立脚本，直接改库）
 
-清洗范围：
-  1. 数据异常   OHLC缺失/非正价/高低颠倒/影线越界 → 删除
-  2. 除权残留   相邻日涨跌幅超出涨跌停允许范围（前复权序列不该出现）
-                → 整只代码从前复权源重新下载全量替换（ETF孤立跳变放行）
-  3. 停牌       上市区间内超长日历缺口 / 零成交 → 报告（缺数据是事实，不造数）
-  4. 退市       最后bar距今超180天 → 记入 delisted 表并报告
-  5. 价格粘性   连续≥20日收盘价完全不变（坏源冻结数据）→ 视同异常重拉
+背景（2026-09 全库体检结论）：
+  东财/腾讯的"前复权"使用除权公式，现金分红做减法。长期高分红股
+  历史前复权价会趋近 0 甚至为负（如潞安环能 2020-02 收盘 0.088 元），
+  导致全库 961 只股票出现 3791 处假跳变（|单日涨跌|>21%，个别 +241%/+300%）。
+  收益率、形态匹配、标签全部被污染。
+
+修复口径：
+  库内统一存【后复权 hfq】（乘法、恒正、收益率正确）；
+  另外维护 adjust(code->K) 表：K=最新不复权价/后复权末价，
+  读取层用 hfq*K 还原为"乘法前复权"用于展示（收益率不变）。
 
 用法：
-  python data_clean.py           # 只扫描+输出报告（不改库）
-  python data_clean.py --fix     # 扫描+执行修复
-  python data_clean.py --db x.db # 指定库路径
+  python data_clean.py                  # 只扫描报告（不改库）
+  python data_clean.py --fix            # 扫描+修复异常代码（hfq 口径）
+  python data_clean.py --all-adj        # 全库复权口径迁移（hfq+adjust，断点续传）
+  python data_clean.py --all-adj --workers 3 --limit 500
+  python data_clean.py --db x.db
 """
 import argparse
 import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 import urllib.request
 from datetime import date, datetime
 
 DB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                   "stock_cache.db")
-# 涨跌停限制(%)：(板块前缀, 创业板2020-08-24注册制后20%)，北交所30
 REPORT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "清洗报告_" + time.strftime("%Y%m%d") + ".md")
+EM_HOSTS = ("push2his.eastmoney.com", "92.push2his.eastmoney.com",
+            "93.push2his.eastmoney.com", "97.push2his.eastmoney.com")
+TX_HOSTS = ("https://ifzq.gtimg.cn/appstock/app/fqkline/get",
+            "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
+            "http://ifzq.gtimg.cn/appstock/app/fqkline/get")
+
+_rate_lock = threading.Lock()
+_last_req = [0.0]
+MIN_INTERVAL = 0.25
+
+
+def _throttle():
+    with _rate_lock:
+        dt = time.time() - _last_req[0]
+        if dt < MIN_INTERVAL:
+            time.sleep(MIN_INTERVAL - dt)
+        _last_req[0] = time.time()
+
+
+def _get(url, decode="utf-8", retries=3, timeout=20, headers=None):
+    last = None
+    for i in range(retries):
+        _throttle()
+        try:
+            req = urllib.request.Request(
+                url, headers=headers or {
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": "https://quote.eastmoney.com/"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read().decode(decode, "ignore")
+        except Exception as e:
+            last = e
+            time.sleep(0.6 * (i + 1))
+    raise last
 
 
 def _limit_pct(code, name, d):
@@ -38,7 +77,7 @@ def _limit_pct(code, name, d):
     if code.startswith("bj"):
         return 30.0
     board = code[2:4] if len(code) >= 4 else ""
-    if board in ("68",):
+    if board == "68":
         return 20.0
     if board == "30":
         return 20.0 if d >= "2020-08-24" else 10.0
@@ -52,17 +91,11 @@ def _is_etf(code):
     return pre in ("51", "56", "58", "15", "16", "18")
 
 
-def _fetch_em_qfq(full, count=1200):
-    """东财前复权日K（与主程序同接口，用于整只替换）。"""
-    secid = ("1." if full.startswith("sh") else "0.") + full[2:]
-    url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
-           f"?secid={secid}&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56"
-           f"&klt=101&fqt=1&beg=0&end=20500101&lmt={count}")
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "Mozilla/5.0",
-                      "Referer": "https://quote.eastmoney.com/"})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        kd = json.loads(r.read().decode("utf-8", "ignore"))
+def _secid(full):
+    return ("1." if full.startswith("sh") else "0.") + full[2:]
+
+
+def _parse_em(kd):
     out = []
     for line in (kd.get("data") or {}).get("klines") or []:
         p = line.split(",")
@@ -78,18 +111,241 @@ def _fetch_em_qfq(full, count=1200):
     return out
 
 
+def _fetch_em_kline(full, fqt=2, count=8000):
+    """东财日K。fqt=2 后复权（迁移主源），fqt=0 不复权，fqt=1 勿用。"""
+    for host in EM_HOSTS:
+        try:
+            txt = _get(
+                f"https://{host}/api/qt/stock/kline/get"
+                f"?secid={_secid(full)}&fields1=f1,f2,f3"
+                f"&fields2=f51,f52,f53,f54,f55,f56"
+                f"&klt=101&fqt={fqt}&beg=0&end=20500101&lmt={count}")
+            out = _parse_em(json.loads(txt))
+            if out:
+                return out
+        except Exception:
+            continue
+    return []
+
+
+_TX_RAW = {}
+
+
+def _parse_qt(qt):
+    """腾讯快照 qt → 最新原始价（不复权）。"""
+    if not isinstance(qt, dict):
+        return None
+    for v in qt.values():
+        if isinstance(v, (list, tuple)) and len(v) > 3:
+            try:
+                p = float(v[3])
+                if p > 0:
+                    return p
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _fetch_tx_kline(full, fq="hfq", pages=3, page=800):
+    """腾讯日K（后复权，翻页补历史），fq='' 为不复权。"""
+    out, end, have = [], "", set()
+    key = {"hfq": "hfqday", "qfq": "qfqday"}.get(fq, "day")
+    for _ in range(pages):
+        param = (f"?param={full},day,,{end},{page},{fq}" if (end and fq)
+                 else f"?param={full},day,,,{page},{fq}" if fq
+                 else f"?param={full},day,,,{page}")
+        got = None
+        for host in TX_HOSTS:
+            try:
+                txt = _get(host + param, retries=1, timeout=10)
+                d = (json.loads(txt).get("data") or {}).get(full) or {}
+                p = _parse_qt(d.get("qt"))
+                if p:
+                    _TX_RAW[full] = p
+                bars = d.get(key) or d.get("day") or []
+                if bars:
+                    got = bars
+                    break
+            except Exception:
+                continue
+        if not got:
+            break
+        rows = []
+        for b in got:
+            try:
+                if float(b[2]) <= 0:
+                    continue
+                rows.append((b[0], float(b[1]), float(b[3]), float(b[4]),
+                             float(b[2]), float(b[5])))
+            except (ValueError, IndexError):
+                continue
+        add = [r for r in rows if r[0] not in have]
+        if not add:
+            break
+        out = add + out
+        have.update(r[0] for r in add)
+        if len(got) < page - 10:
+            break
+        try:
+            d0 = datetime.strptime(out[0][0], "%Y-%m-%d").date()
+            end = (d0 - __import__("datetime").timedelta(days=1)).isoformat()
+        except Exception:
+            break
+    return out
+
+
+def fetch_raw_last(full):
+    """最新不复权价：腾讯快照(qt) → 东财 fqt=0 → 腾讯不复权K线。"""
+    if _TX_RAW.get(full):
+        return _TX_RAW[full]
+    try:
+        rows = _fetch_em_kline(full, fqt=0, count=5)
+        if rows:
+            return rows[-1][4]
+    except Exception:
+        pass
+    try:
+        rows = _fetch_tx_kline(full, fq="", pages=1, page=5)
+        if rows:
+            return rows[-1][4]
+    except Exception:
+        pass
+    try:                    # hfq 请求响应里也带 qt 快照
+        _fetch_tx_kline(full, fq="hfq", pages=1, page=5)
+    except Exception:
+        pass
+    return _TX_RAW.get(full)
+
+
 def _bar_valid(b):
-    """单根bar结构校验：OHLC非空非负、high≥low、high≥max(o,c)、low≤min(o,c)。"""
     o, h, l, cl = b[1], b[2], b[3], b[4]
-    if None in (o, h, l, cl):
+    if None in (o, h, l, cl) or min(o, h, l, cl) <= 0:
         return False
-    if min(o, h, l, cl) <= 0:
-        return False
-    if h < l:
-        return False
-    if h < max(o, cl) or l > min(o, cl):
+    if h < l or h < max(o, cl) or l > min(o, cl):
         return False
     return True
+
+
+def _validate(rows, code, name):
+    """hfq 序列健康检查：结构合法 + 除前5根新股外无涨跌停越界。"""
+    if len(rows) < 100:
+        return False, len(rows), "历史不足100根"
+    viol = 0
+    for i in range(max(5, 1), len(rows)):
+        prev = rows[i - 1]
+        cur = rows[i]
+        lim = _limit_pct(code, name, cur[0])
+        if lim is None or not prev[4] or not cur[4]:
+            continue
+        if not _bar_valid(cur):
+            viol += 1
+            continue
+        if abs(cur[4] / prev[4] - 1) * 100 > lim + 3.0:
+            viol += 1
+    return viol <= 3, viol, ""
+
+
+def ensure_tables(conn):
+    conn.execute("CREATE TABLE IF NOT EXISTS adjust("
+                 "code TEXT PRIMARY KEY, k REAL, ts REAL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS adj_done("
+                 "code TEXT PRIMARY KEY, ts REAL, bars INTEGER, last_date TEXT)")
+
+
+def set_adjust(conn, code, k):
+    if k and k > 0:
+        conn.execute("INSERT OR REPLACE INTO adjust VALUES(?,?,?)",
+                     (code, float(k), time.time()))
+
+
+def migrate_one(conn, full, name, log=None, force=False, min_bars=100):
+    """把单只代码迁移为后复权(hfq)存储 + 写入显示缩放 K。返回状态串。"""
+    row = conn.execute("SELECT ts FROM adj_done WHERE code=?",
+                       (full,)).fetchone()
+    if row and not force:
+        return "skip"
+    rows = _fetch_em_kline(full, fqt=2)
+    src = "em"
+    if len(rows) < min_bars:
+        tx = _fetch_tx_kline(full, fq="hfq", pages=6)
+        if len(tx) > len(rows):
+            rows, src = tx, "tx"
+    if len(rows) < min_bars:
+        return "nodata"
+    ok, viol, why = _validate(rows, full, name)
+    if not ok:
+        return f"reject({why or 'viol=%d' % viol})"
+    raw = fetch_raw_last(full)
+    k = (raw / rows[-1][4]) if (raw and rows[-1][4] > 0) else None
+    today = time.strftime("%Y-%m-%d")
+    bars = [r for r in rows if r[0] < today]
+    if not bars:
+        return "nodata"
+    conn.execute("DELETE FROM daily_bars WHERE code=?", (full,))
+    conn.executemany(
+        "INSERT OR REPLACE INTO daily_bars"
+        "(code,date,open,high,low,close,vol) VALUES(?,?,?,?,?,?,?)",
+        [(full, r[0], r[1], r[2], r[3], r[4], r[5]) for r in bars])
+    if k:
+        set_adjust(conn, full, k)
+    conn.execute("INSERT OR REPLACE INTO adj_done VALUES(?,?,?,?)",
+                 (full, time.time(), len(bars), bars[-1][0]))
+    conn.commit()
+    if log:
+        ks = f"K={k:.4f}" if k else "K=?"
+        log(f"  [{src}] {full} {len(bars)}根 "
+            f"{bars[0][0]}~{bars[-1][0]} {ks}")
+    return "ok"
+
+
+def migrate_all(db, workers=2, limit=None, force=False, log=print,
+                min_bars=100):
+    """全库迁移（可由多进程/多机分片：--shard i/n）。"""
+    conn = sqlite3.connect(db, timeout=60)
+    conn.execute("PRAGMA journal_mode=WAL")
+    ensure_tables(conn)
+    names = {r[0]: (r[1] or "") for r in
+             conn.execute("SELECT code, name FROM stocks").fetchall()}
+    codes = [r[0] for r in conn.execute(
+        "SELECT code FROM daily_bars GROUP BY code HAVING COUNT(*)>=? "
+        "ORDER BY code", (min_bars,)).fetchall()
+        if not r[0].startswith("bj")]
+    if limit:
+        codes = codes[:limit]
+    todo = [c for c in codes
+            if force or not conn.execute(
+                "SELECT 1 FROM adj_done WHERE code=?", (c,)).fetchone()]
+    log(f"待迁移 {len(todo)}/{len(codes)} 只（workers={workers}）")
+    lock = threading.Lock()
+    done = [0]
+
+    def one(c):
+        lconn = sqlite3.connect(db, timeout=60)
+        lconn.execute("PRAGMA journal_mode=WAL")
+        try:
+            st = migrate_one(lconn, c, names.get(c, ""), force=force,
+                             min_bars=min_bars)
+        except Exception as e:
+            st = f"err({str(e)[:60]})"
+        finally:
+            lconn.close()
+        with lock:
+            done[0] += 1
+            if done[0] % 50 == 0 or done[0] == len(todo):
+                log(f"  迁移 {done[0]}/{len(todo)} ({done[0]*100//max(1,len(todo))}%)")
+        if st.startswith(("err", "reject")):
+            with lock:
+                bad.append((c, st))
+
+    bad = []
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(one, todo))
+    log(f"迁移完成：成功{len(todo)-len(bad)} 异常{len(bad)}")
+    for c, st in bad[:40]:
+        log(f"  ! {c} {st}")
+    conn.close()
+    return bad
 
 
 def scan(conn):
@@ -107,7 +363,9 @@ def scan(conn):
     issues = {}
     stats = {"codes": len(by), "bars": len(rows), "bad_bars": 0,
              "refetch": 0, "suspicious": 0, "delisted": 0,
-             "zero_vol": 0, "stale": 0}
+             "zero_vol": 0, "stale": 0, "low_price": 0,
+             "neg_price": 0, "stale_vs_market": 0}
+    market_last = max((b[-1][0] for b in by.values()), default="")
 
     def add(c, kind, detail):
         issues.setdefault(c, []).append((kind, detail))
@@ -120,7 +378,9 @@ def scan(conn):
         if bad:
             add(c, "bad_bars", f"{len(bad)}根结构异常(如 {bad[0][0]})")
             stats["bad_bars"] += len(bad)
-        # ---- 2) 涨跌幅越界（疑似除权残留/坏数据）----
+            stats["neg_price"] += sum(
+                1 for b in bad if min(b[1], b[2], b[3], b[4]) < 0)
+        # ---- 2) 涨跌幅越界（除权公式前复权残留/坏数据）----
         flags = []
         for prev, cur in zip(bars, bars[1:]):
             pc, cl = prev[4], cur[4]
@@ -134,14 +394,16 @@ def scan(conn):
             add(c, "refetch",
                 f"{len(viol)}处涨跌幅越界(首处 {bars[viol[0] + 1][0]})")
             stats["refetch"] += 1
-        elif viol:      # ETF：连续两处才判坏
+        elif viol:
             consec = any(b and a for a, b in zip(flags, flags[1:]))
             if consec:
                 add(c, "refetch", "ETF连续越界跳变")
                 stats["refetch"] += 1
+        # ---- 2b) 价格失真（前复权做减法导致末价过低）----
+        if bars[-1][4] is not None and bars[-1][4] < 0.5:
+            add(c, "low_price", f"末价 {bars[-1][4]:.3f} 失真")
+            stats["low_price"] += 1
         # ---- 3) 停牌缺口 / 零成交 ----
-        d0 = datetime.strptime(bars[0][0], "%Y-%m-%d").date()
-        d1 = datetime.strptime(bars[-1][0], "%Y-%m-%d").date()
         gaps = []
         for a, b in zip(bars, bars[1:]):
             da = datetime.strptime(a[0], "%Y-%m-%d").date()
@@ -155,10 +417,19 @@ def scan(conn):
         if zv:
             stats["zero_vol"] += zv
         # ---- 4) 退市 ----
+        d1 = datetime.strptime(bars[-1][0], "%Y-%m-%d").date()
         age = (today - d1).days
         if age > 180:
             add(c, "delisted", f"最后bar {bars[-1][0]} (距今{age}天)")
             stats["delisted"] += 1
+        # ---- 4b) 相对市场最新日陈旧（回填中断/漏拉）----
+        elif market_last and bars[-1][0] < market_last:
+            dl = (datetime.strptime(market_last, "%Y-%m-%d").date()
+                  - d1).days
+            if dl > 10:
+                add(c, "stale_vs_market",
+                    f"最后bar {bars[-1][0]}，落后市场 {dl} 天")
+                stats["stale_vs_market"] += 1
         # ---- 5) 价格粘性（连续≥20日收盘不变）----
         run = 1
         for (a, b) in zip(bars, bars[1:]):
@@ -170,61 +441,34 @@ def scan(conn):
     return issues, stats, names
 
 
-def fix(conn, issues, log):
-    """执行修复：删结构异常bar；越界/粘性代码整只重拉替换；退市入表。"""
-    conn.execute("CREATE TABLE IF NOT EXISTS delisted("
-                 "code TEXT PRIMARY KEY, last_date TEXT, ts REAL)")
-    today = time.strftime("%Y-%m-%d")
-    for c, items in issues.items():
-        kinds = {k for k, _ in items}
-        # 1) 删结构异常
-        if "bad_bars" in kinds:
-            bars = conn.execute(
-                "SELECT date,open,high,low,close FROM daily_bars "
-                "WHERE code=? ORDER BY date", (c,)).fetchall()
-            bad = [(c, b[0]) for b in bars if not _bar_valid(b)]
-            if bad:
-                conn.executemany(
-                    "DELETE FROM daily_bars WHERE code=? AND date=?", bad)
-                log(f"  [删] {c} 结构异常{len(bad)}根")
-        # 2) 整只重拉替换（除权残留/粘性）
-        if ("refetch" in kinds or "stale" in kinds) and not c.startswith("bj"):
-            try:
-                fresh = _fetch_em_qfq(c)
-                if len(fresh) >= 200:
-                    conn.execute("DELETE FROM daily_bars WHERE code=?", (c,))
-                    conn.executemany(
-                        "INSERT OR REPLACE INTO daily_bars"
-                        "(code,date,open,high,low,close,vol) "
-                        "VALUES(?,?,?,?,?,?,?)",
-                        [(c, *r) for r in fresh if r[0] < today])
-                    log(f"  [换] {c} 重拉{len(fresh)}根(前复权全量替换)")
-                else:
-                    log(f"  [跳] {c} 重拉仅{len(fresh)}根，保守起见不动")
-            except Exception as e:
-                log(f"  [败] {c} 重拉失败: {e}")
-        # 3) 退市登记
-        dl = next((d for k, d in items if k == "delisted"), None)
-        if dl:
-            last = dl.split(" ")[0]
-            conn.execute("INSERT OR REPLACE INTO delisted VALUES(?,?,?)",
-                         (c, last, time.time()))
-    conn.commit()
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fix", action="store_true", help="执行修复(默认只报告)")
+    ap.add_argument("--all-adj", action="store_true",
+                    help="全库复权口径迁移(存hfq+adjust, 断点续传)")
+    ap.add_argument("--workers", type=int, default=2,
+                    help="--all-adj 并发数（免费源限流，建议2~3）")
+    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--force", action="store_true")
     ap.add_argument("--db", default=DB)
     args = ap.parse_args()
 
     lines = [f"# 数据清洗报告 {time.strftime('%Y-%m-%d %H:%M')}",
-             f"库: `{args.db}`  模式: **{'修复' if args.fix else '只扫描'}**",
+             f"库: `{args.db}`  模式: "
+             f"**{'迁移' if args.all_adj else ('修复' if args.fix else '只扫描')}**",
              ""]
 
     def log(s):
         print(s, flush=True)
         lines.append(s)
+
+    if args.all_adj:
+        bad = migrate_all(args.db, workers=args.workers, limit=args.limit,
+                          force=args.force, log=log)
+        with open(REPORT_PATH, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"\n报告已保存: {REPORT_PATH}")
+        return
 
     conn = sqlite3.connect(args.db, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -232,11 +476,14 @@ def main():
     issues, stats, names = scan(conn)
     log(f"扫描完成({time.time() - t0:.0f}s)：{stats['codes']}只代码 "
         f"{stats['bars']}根日K")
-    log(f"- 结构异常bar: {stats['bad_bars']}")
-    log(f"- 涨跌幅越界(疑似除权残留,整只重拉): {stats['refetch']}只")
-    log(f"- 长停牌缺口: {stats['suspicious']}只 | 零成交bar: {stats['zero_vol']}")
-    log(f"- 疑似退市(>180天无数据): {stats['delisted']}只")
-    log(f"- 价格粘性(冻结数据): {stats['stale']}只")
+    for k, label in (("bad_bars", "结构异常bar"), ("refetch",
+                     "涨跌幅越界(疑似前复权失真,需迁移)"),
+                     ("low_price", "末价<0.5元"), ("neg_price", "负价bar"),
+                     ("suspicious", "长停牌缺口"), ("zero_vol", "零成交bar"),
+                     ("delisted", "疑似退市(>180天)"),
+                     ("stale_vs_market", "落后市场最新日>10天"),
+                     ("stale", "价格粘性")):
+        log(f"- {label}: {stats[k]}")
     log("")
     if issues:
         log("## 问题明细（按代码）")
@@ -251,9 +498,25 @@ def main():
         log("未发现问题数据。")
     if args.fix:
         log("")
-        log("## 修复动作")
-        fix(conn, issues, log)
-        log("修复完成。")
+        log("## 修复动作（整只按 hfq 迁移）")
+        conn.execute("CREATE TABLE IF NOT EXISTS delisted("
+                     "code TEXT PRIMARY KEY, last_date TEXT, ts REAL)")
+        ensure_tables(conn)
+        fixed = 0
+        for c, items in issues.items():
+            kinds = {k for k, _ in items}
+            if kinds & {"bad_bars", "refetch", "low_price", "stale",
+                        "stale_vs_market"} and not c.startswith("bj"):
+                st = migrate_one(conn, c, names.get(c, ""), log=log)
+                if st == "ok":
+                    fixed += 1
+            dl = next((d.split(" ")[0] for k, d in items
+                       if k == "delisted"), None)
+            if dl:
+                conn.execute("INSERT OR REPLACE INTO delisted VALUES(?,?,?)",
+                             (c, dl, time.time()))
+        conn.commit()
+        log(f"修复完成：成功 {fixed} 只")
     conn.close()
     with open(REPORT_PATH, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")

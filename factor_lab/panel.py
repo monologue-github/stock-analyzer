@@ -218,13 +218,36 @@ def _l3_worker(group):
     return out
 
 
-def stage_build(limit=None, workers=None):
+def sample_codes(n, seed=7, min_bars=MIN_BARS):
+    """按行业分层随机抽样 n 只（可复现）。"""
+    codes = data_mod.list_codes(min_bars=min_bars)
+    meta = data_mod.load_meta()
+    rng = np.random.RandomState(seed)
+    by_ind = {}
+    for c in codes:
+        by_ind.setdefault(meta.get(c, {}).get("industry", ""), []).append(c)
+    picked = []
+    per_ind = max(1, n // max(1, len(by_ind)))
+    for ind, cs in sorted(by_ind.items()):
+        k = min(per_ind, len(cs))
+        picked.extend(rng.choice(cs, size=k, replace=False).tolist())
+    if len(picked) < n:
+        rest = [c for c in codes if c not in set(picked)]
+        rng.shuffle(rest)
+        picked.extend(rest[:n - len(picked)])
+    return sorted(picked[:n])
+
+
+def stage_build(limit=None, workers=None, sample=None, seed=7):
     t0 = time.time()
     os.makedirs(CACHE_DIR, exist_ok=True)
     meta = data_mod.load_meta()
-    codes = data_mod.list_codes(min_bars=MIN_BARS)
-    if limit:
-        codes = codes[:limit]
+    if sample:
+        codes = sample_codes(sample, seed=seed)
+    else:
+        codes = data_mod.list_codes(min_bars=MIN_BARS)
+        if limit:
+            codes = codes[:limit]
     print(f"股票池 {len(codes)} 只")
     ind5, med_lead = industry_context()
     glob = {"industry_of": {c: meta.get(c, {}).get("industry", "")

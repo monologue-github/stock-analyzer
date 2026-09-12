@@ -683,14 +683,22 @@ def _code_to_em(full):
     return None
 
 
-def _fetch_tencent(full, count=600, host=None):
-    """腾讯K线。host 可换备用域名（主域被限流时走代理域/HTTP域）。"""
+def _fetch_tencent(full, count=600, host=None, fq="hfq"):
+    """腾讯K线。host 可换备用域名（主域被限流时走代理域/HTTP域）。
+
+    fq='hfq'（默认，后复权，永远为正、乘法口径）；fq='qfq' 为腾讯
+    除权公式前复权（现金分红做减法，长期高分红股会趋近 0/为负——
+    已证实为此前全库假跳变根因，勿再入库）；fq='' 为不复权。
+    返回 rows；原始实时价从响应 qt 字段解析（_tx_last_raw）。
+    """
     host = host or KLINE_URL
-    txt = _http_get(host + f"?param={full},day,,,{count},qfq",
-                    decode="utf-8", retries=1, timeout=8)
+    param = (f"?param={full},day,,,{count},{fq}" if fq
+             else f"?param={full},day,,,{count}")
+    txt = _http_get(host + param, decode="utf-8", retries=1, timeout=8)
     kd = json.loads(txt)
     d = (kd.get("data") or {}).get(full) or {}
-    bars = d.get("qfqday") or d.get("day") or []
+    key = {"hfq": "hfqday", "qfq": "qfqday"}.get(fq, "day")
+    bars = d.get(key) or d.get("day") or []
     out = []
     for b in bars:
         try:
@@ -701,7 +709,89 @@ def _fetch_tencent(full, count=600, host=None):
                         "low": float(b[4]), "vol": float(b[5])})
         except (ValueError, IndexError):
             continue
+    try:
+        _tx_raw_cache[full] = _tx_quote_raw(d.get("qt"))
+    except Exception:
+        pass
     return out
+
+
+_tx_raw_cache = {}
+_LAST_RAW = {}
+
+
+def _tx_quote_raw(qt):
+    """从腾讯若快照 qt 里取最新原始价（不复权）。"""
+    if not isinstance(qt, dict):
+        return None
+    for v in qt.values():
+        if isinstance(v, (list, tuple)) and len(v) > 3:
+            try:
+                p = float(v[3])
+                if p > 0:
+                    return p
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _raw_last_price(full):
+    """最新不复权收盘价（腾讯快照优先，其次东财 fqt=0，最后缓存）。
+    用于把后复权价缩放到"乘法前复权"显示口径。失败返回 None。"""
+    p = _tx_raw_cache.get(full)
+    if p:
+        return p
+    try:
+        rows = _fetch_tencent(full, count=5, fq="")
+        if rows:
+            return rows[-1]["close"]
+    except Exception:
+        pass
+    try:
+        rows = _fetch_eastmoney(full, count=5, fqt=0)
+        if rows:
+            return rows[-1]["close"]
+    except Exception:
+        pass
+    v = _LAST_RAW.get(full)
+    return v
+
+
+def _set_adjust(full, k):
+    """记录显示缩放系数 K=真实现价/后复权末价，供 get_daily 转乘法前复权。"""
+    if not k or k <= 0:
+        return
+    try:
+        with db_conn(commit=True) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS adjust("
+                         "code TEXT PRIMARY KEY, k REAL, ts REAL)")
+            conn.execute("INSERT OR REPLACE INTO adjust VALUES(?,?,?)",
+                         (full, float(k), time.time()))
+    except Exception:
+        log.exception("adjust 写入失败 %s", full)
+
+
+def _get_adjust(full):
+    try:
+        with db_conn() as conn:
+            r = conn.execute("SELECT k FROM adjust WHERE code=?",
+                             (full,)).fetchone()
+        return float(r[0]) if r and r[0] else None
+    except Exception:
+        return None
+
+
+def _sync_adjust(full, rows):
+    """按最新原始价刷新显示缩放系数（后复权→乘法前复权）。"""
+    if not rows:
+        return
+    try:
+        last = rows[-1]["close"]
+        raw = _raw_last_price(full)
+        if raw and last and last > 0:
+            _set_adjust(full, raw / last)
+    except Exception:
+        log.debug("sync_adjust 失败 %s", full, exc_info=True)
 
 
 def _fetch_163(full, count=600):
@@ -741,8 +831,11 @@ def _fetch_163(full, count=600):
     return out[:count]
 
 
-def _fetch_eastmoney(full, count=600):
-    """东方财富K线（免费，JSON格式）。多 host 轮询防限流。"""
+def _fetch_eastmoney(full, count=600, fqt=2):
+    """东方财富K线（免费，JSON格式）。多 host 轮询防限流。
+
+    fqt: 0=不复权, 1=东财前复权(除权公式/减法，高分红股会为负，勿入库),
+    2=后复权(默认)。"""
     secid = _code_to_em(full)
     if not secid:
         return []
@@ -755,7 +848,7 @@ def _fetch_eastmoney(full, count=600):
         url = (f"https://{host}/api/qt/stock/kline/get"
                f"?secid={secid}&fields1=f1,f2,f3"
                f"&fields2=f51,f52,f53,f54,f55,f56"
-               f"&klt=101&fqt=1&beg=0&end=20500101&lmt={count}")
+               f"&klt=101&fqt={fqt}&beg=0&end=20500101&lmt={count}")
         try:
             txt = _http_get(url, retries=2, timeout=20,
                             headers={"Referer": "https://quote.eastmoney.com/"})
@@ -823,6 +916,8 @@ def _fetch_remote_rows(full, count=600):
        选冷却结束最早的源强行试一次，成功即重置熔断；
     3. 单次调用内只对一个源做至多2次限流重试，
        失败立刻切下一源，避免整体请求被单源拖死。"""
+        # 注意：只使用后复权(hfq)源。163/新浪只提供不复权(或减法前复权)，
+    # 与库内后复权口径混用会产生假跳变，不再作为持久化源。
     sources = [
         ("腾讯", lambda: _fetch_tencent(full, count)),
         ("腾讯代理", lambda: _fetch_tencent(
@@ -833,8 +928,6 @@ def _fetch_remote_rows(full, count=600):
             full, count,
             "http://ifzq.gtimg.cn/appstock/app/fqkline/get")),
         ("东财", lambda: _fetch_eastmoney(full, count)),
-        ("新浪", lambda: _fetch_sina(full, count)),
-        ("网易163", lambda: _fetch_163(full, count)),
     ]
     last_err = None
     usable = [(n, f) for n, f in sources if _cb_ok(n)]
@@ -978,13 +1071,26 @@ def _maybe_ai_rescue():
     return True
 
 
+def _display_rows(full, rows, tail=None):
+    """把库内后复权(hfq)价格按 adjust 系数转成"乘法前复权"供展示/分析。
+
+    收益率在两种口径下完全一致；仅价格水平不同。无 adjust 记录时原样返回。"""
+    k = _get_adjust(full)
+    if k and k > 0 and rows:
+        rows = [{"date": r["date"], "open": r["open"] * k,
+                 "high": r["high"] * k, "low": r["low"] * k,
+                 "close": r["close"] * k, "vol": r["vol"]} for r in rows]
+    return rows[-tail:] if (tail and len(rows) > tail) else rows
+
+
 def get_daily(full: str, min_bars: int = 100, tail=None):
     """带缓存的日K：本地够新且无异常直接返回，否则增量爬一次并入库。
     加载缓存后校验每日涨跌幅是否超出该股允许的涨跌停范围，
     数据异常则删除本地缓存全量重新下载。
     有缓存数据的股票永远返回数据（即使过期），不抛异常。
     只有从未成功获取过的代码才会触发网络请求和负缓存。
-    tail: 非空时只返回最近 tail 根（用于启动快速预览，走缓存秒开）。"""
+    tail: 非空时只返回最近 tail 根（用于启动快速预览，走缓存秒开）。
+    库内一律存后复权(hfq)；返回前按 adjust 缩放为乘法前复权显示。"""
     today = time.strftime("%Y-%m-%d")
     fresh = last_completed_td()
     with db_conn() as conn:
@@ -995,7 +1101,7 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
     bad_cache = bool(rows) and _bars_anomalous(rows, full, name)
     # 1) 有数据、够新且涨跌幅无异常 → 直接返回
     if rows and rows[-1]["date"] >= fresh and not bad_cache:
-        return rows[-tail:] if (tail and len(rows) > tail) else rows
+        return _display_rows(full, rows, tail)
     # 2) 有数据但过期或涨幅异常 → 拉远端（异常时清空全量替换）
     if rows:
         try:
@@ -1032,10 +1138,11 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
             # 重新读取合并后的数据
             with db_conn() as conn3:
                 rows = _db_rows(conn3, full)
+            _sync_adjust(full, rows)
         except Exception:
             log.warning("get_daily 增量拉取失败 %s，回退本地缓存",
                         full, exc_info=True)  # 网络失败就用旧缓存，不报错
-        return rows[-tail:] if (tail and len(rows) > tail) else rows
+        return _display_rows(full, rows, tail)
     # 3) 无数据 → 检查负缓存
     with db_conn() as conn:
         frow = conn.execute("SELECT ts, reason FROM failed WHERE code=?",
@@ -1091,7 +1198,8 @@ def get_daily(full: str, min_bars: int = 100, tail=None):
               r["close"], r["vol"]) for r in remote
              if r["date"] < today and _bar_ok(r)])
         rows = [r for r in _db_rows(conn, full)]
-    return rows[-tail:] if (tail and len(rows) > tail) else rows
+    _sync_adjust(full, rows)
+    return _display_rows(full, rows, tail)
 
 
 def prefetch(codes, workers=6, progress=None):
@@ -1152,9 +1260,9 @@ _BF_PAUSE = [0.0, 0]            # [暂停截止时间, 连续限流次数]
 
 
 def _bf_tx_fetch(full, end, count):
-    """腾讯K线单页：三域名轮换，全部501才抛（触发全局暂停）。"""
-    param = (f"?param={full},day,,{end},{count},qfq" if end
-             else f"?param={full},day,,,{count},qfq")
+    """腾讯K线单页（后复权 hfq）：三域名轮换，全部501才抛（触发全局暂停）。"""
+    param = (f"?param={full},day,,{end},{count},hfq" if end
+             else f"?param={full},day,,,{count},hfq")
     last = None
     for k in range(len(_BF_TX_HOSTS)):
         u = _BF_TX_HOSTS[(_BF_TX_I[0] + k) % len(_BF_TX_HOSTS)]
@@ -1180,7 +1288,7 @@ def _bf_tx_fetch(full, end, count):
 
 
 def _bf_fetch_one(full, page=800):
-    """单只：腾讯翻页为主源，东财一次性全量兜底。"""
+    """单只：腾讯翻页为主源（后复权），东财全量兜底。返回 (rows, raw_last)。"""
     rows1 = _bf_tx_fetch(full, "", page)
     if not rows1:
         raise RuntimeError("腾讯空数据")
@@ -1195,11 +1303,11 @@ def _bf_fetch_one(full, page=800):
         except Exception:
             pass                                # 第二页失败就只装第一页
     if len(rows1) >= 300:
-        return rows1
+        return rows1, _raw_last_price(full)
     try:
         rows = _fetch_eastmoney(full, count=1100)
         if len(rows) >= 300:
-            return rows
+            return rows, _raw_last_price(full)
     except Exception:
         pass
     raise RuntimeError("有效数据不足300根")
@@ -1253,17 +1361,72 @@ def backfill_full_market(progress=None, force=False, limit=0,
             if time.time() < _BF_PAUSE[0]:
                 time.sleep(_BF_PAUSE[0] - time.time())
             try:
-                rows = [r for r in _bf_fetch_one(c)
+                fetched, raw_last = _bf_fetch_one(c)
+                rows = [r for r in fetched
                         if r["date"] < today and _bar_ok(r)]
                 if not rows:
                     raise RuntimeError("过滤后无有效数据")
-                with db_conn(commit=True) as conn:
-                    conn.executemany(
-                        "INSERT OR REPLACE INTO daily_bars"
-                        "(code,date,open,high,low,close,vol) "
-                        "VALUES(?,?,?,?,?,?,?)",
-                        [(c, r["date"], r["open"], r["high"], r["low"],
-                          r["close"], r["vol"]) for r in rows])
+                # 基期一致性：与库内重叠收盘偏差>0.5% 说明旧数据是别的
+                # 复权口径（或旧口径污染），此时不能逐条 upsert，须整只替换
+                with db_conn() as conn:
+                    old = conn.execute(
+                        "SELECT date, close FROM daily_bars WHERE code=? "
+                        "ORDER BY date", (c,)).fetchall()
+                newmap = {r["date"]: r["close"] for r in rows}
+                mismatch, checked = False, 0
+                for d, cl in old[-200:]:
+                    c2 = newmap.get(d)
+                    if c2 and cl:
+                        checked += 1
+                        if abs(c2 / cl - 1) > 0.005:
+                            mismatch = True
+                            break
+                if checked < 5:
+                    mismatch = False
+                if mismatch:
+                    full = []
+                    try:
+                        full = _fetch_eastmoney(c, count=8000)
+                    except Exception:
+                        full = []
+                    if len(full) >= 200 and len(full) >= min(len(old), 400):
+                        conn_rows = [r for r in full if r["date"] < today
+                                     and _bar_ok(r)]
+                        with db_conn(commit=True) as conn:
+                            conn.execute(
+                                "DELETE FROM daily_bars WHERE code=?", (c,))
+                            conn.executemany(
+                                "INSERT OR REPLACE INTO daily_bars"
+                                "(code,date,open,high,low,close,vol) "
+                                "VALUES(?,?,?,?,?,?,?)",
+                                [(c, r["date"], r["open"], r["high"],
+                                  r["low"], r["close"], r["vol"])
+                                 for r in conn_rows])
+                        stat["replaced"] = stat.get("replaced", 0) + 1
+                    elif len(old) <= len(rows):
+                        with db_conn(commit=True) as conn:
+                            conn.execute(
+                                "DELETE FROM daily_bars WHERE code=?", (c,))
+                            conn.executemany(
+                                "INSERT OR REPLACE INTO daily_bars"
+                                "(code,date,open,high,low,close,vol) "
+                                "VALUES(?,?,?,?,?,?,?)",
+                                [(c, r["date"], r["open"], r["high"],
+                                  r["low"], r["close"], r["vol"])
+                                 for r in rows])
+                        stat["replaced"] = stat.get("replaced", 0) + 1
+                    else:
+                        stat["need_migrate"] = stat.get("need_migrate", 0) + 1
+                else:
+                    with db_conn(commit=True) as conn:
+                        conn.executemany(
+                            "INSERT OR REPLACE INTO daily_bars"
+                            "(code,date,open,high,low,close,vol) "
+                            "VALUES(?,?,?,?,?,?,?)",
+                            [(c, r["date"], r["open"], r["high"], r["low"],
+                              r["close"], r["vol"]) for r in rows])
+                if raw_last and rows[-1]["close"] > 0:
+                    _set_adjust(c, raw_last / rows[-1]["close"])
                 _BF_PAUSE[1] = 0
                 stat["ok"] += 1
             except Exception as e:
@@ -1335,6 +1498,11 @@ def clean_daily_db(fix=True, progress=None):
             if bad:
                 issues.setdefault(c, []).append("bad")
                 stats["bad_bars"] += len(bad)
+            # 价格失真：末价过低（除权公式前复权长期做减法导致）
+            if bars and bars[-1][4] is not None and bars[-1][4] < 0.5:
+                issues.setdefault(c, []).append("refetch")
+                stats["refetch"] += 1
+                stats["low_price"] = stats.get("low_price", 0) + 1
             flags = []
             name = names.get(c, "")
             for prev, cur in zip(bars, bars[1:]):
@@ -1393,7 +1561,7 @@ def clean_daily_db(fix=True, progress=None):
                 if ("refetch" in kinds_set or "stale" in kinds_set) \
                         and not c.startswith("bj"):
                     try:
-                        fresh = _bf_fetch_one(c)
+                        fresh, raw_last = _bf_fetch_one(c)
                         fd = [r for r in fresh
                               if r["date"] < time.strftime("%Y-%m-%d")]
                         if len(fd) >= 200:
@@ -1406,6 +1574,8 @@ def clean_daily_db(fix=True, progress=None):
                                 [(c, r["date"], r["open"], r["high"],
                                   r["low"], r["close"], r["vol"])
                                  for r in fd])
+                            if raw_last and fd[-1]["close"] > 0:
+                                _set_adjust(c, raw_last / fd[-1]["close"])
                             stats["refetched"] += 1
                     except Exception:
                         pass            # 源不可用时保留原数据，下次再修
