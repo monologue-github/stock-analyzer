@@ -157,6 +157,41 @@ gzip -d stock_cache.db.gz
 
 ---
 
+## 每只股票自动策略消融（v3.3 风格 · 全 A 待跑）
+
+> 脚本：`backtest_strategy_ablation.py`（已优化，未跑全 A）  
+> 口径：与 GUI「工具 → 多算法消融选策略」完全一致。
+
+对每只股票单独执行：
+1. 取近 **1000 交易日**；
+2. 生成候选信号：MACD 金叉死叉 / KDJ 低位金叉高位死叉 / RSI 超卖回升超买回落 / 布林带下轨回升上轨回落 / MA20 上穿下穿 MA60 / L1 形态上行概率 / 多维评分 × 3 档风险；
+3. 训练集（前 75%）选型，验证集（后 25%）只报告，**验证集绝不参与选择**；
+4. 按保守（最小回撤）、稳健（收益回撤比最大）、激进（最大年化）三档目标，分别为该股选出最优策略；
+5. 两层输出：
+   - `research/strategy_ablation_per_stock.json`：每只股票的三档最优策略、全部候选策略的训练/验证指标、牛熊分段收益；
+   - `research/strategy_ablation_summary.json`：全市场聚合统计，包括各算法/档位选中占比、训练/验证集年化/回撤/胜率/交易数中位数。
+
+### 运行方式
+
+```bash
+# 全 A 股（5518 只左右，预计耗时较长，可先睡前启动）
+python backtest_strategy_ablation.py
+
+# 测试前 100 只
+python backtest_strategy_ablation.py --limit 100 --workers 4
+```
+
+### 优化点
+
+- **多进程并行**：`ProcessPoolExecutor`，默认 `min(8, CPU 核心数)`；
+- **指数 regime 全市场共享**：上证指数 `sh000001` 只加载一次，所有股票共用；
+- **单文件函数调用**：直接复用 `stock_gui.py` 的 `_sig_*` / `_composite_signals` / `_bt_events`，保证口径与 GUI 完全一致；
+- **去除 GUI/tkinter 依赖**：纯 CLI，适合服务器后台跑批。
+
+> ⚠️ 全 A 结果尚未生成。当前脚本已用小样本（10 只）验证可运行，未写入正式报告。
+
+---
+
 ## 使用方法
 
 ```bash
@@ -186,6 +221,7 @@ python stock_gui.py
 | `build_cli.py` | GUI → CLI 打包器，保证算法同步 |
 | `data_clean.py` | 独立数据清洗工具（默认只报告，`--fix` 才改库） |
 | `backfill_full.py` | 旧版独立回填脚本，保留备用 |
+| `backtest_strategy_ablation.py` | **全 A 股每只股票自动策略消融**（MACD/KDJ/RSI/布林/MA/L1/多维评分 × 三档风险，训练选型/验证报告） |
 | `stock_cache.db` | 本地 SQLite 日K缓存（约 808 万根） |
 | `research/v4_report.json` | **最新全A研究报告**（全指标） |
 | `research/v4_factors.json` | 每股因子表 |
