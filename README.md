@@ -19,12 +19,15 @@
 
 全市场前复权日K已打包，下载后无需再爬数据：
 
-> **下载**：<https://github.com/monologue-github/stock-analyzer/releases/download/v4.0-cache/stock_cache.db.gz>（约 218 MB，解压后约 1 GB）
+> **日K缓存下载**：<https://github.com/monologue-github/stock-analyzer/releases/download/v4.0-cache/stock_cache.db.gz>（约 218 MB，解压后约 1 GB）
 
 ```bash
 gzip -d stock_cache.db.gz
 # 放到 stock_gui.py / stock_predict.py 同目录即可
 ```
+
+> **研究报告下载**：<https://github.com/monologue-github/stock-analyzer/releases/download/v4.0.2-research/research.zip>（约 154 MB，解压后约 324 MB）  
+> 含 `strategy_ablation_per_stock.json` / `strategy_ablation_summary.json` / `v4_report.json` / `v4_factors.json` / `legacy/` 等。网页端直接打开大 JSON 会卡，建议下载本地查看。
 
 - 覆盖约 **5500 只** A 股代码（含指数/ETF 参考），**808 万根日K**；
 - 其中 **5017 只具备 ≥950 个交易日**（≈4 年）；
